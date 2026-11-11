@@ -15,12 +15,35 @@ using System.Windows.Forms;
 
 namespace FlukeEventView
 {
+    /// <summary>
+    /// Перечисление доступных языков интерфейса программы (Русский / Английский).
+    /// </summary>
     public enum AppLang
     {
         Ru = 0,
         En = 1
     }
 
+    /// <summary>
+    /// Категории событий для фильтрации журнала по типам помех.
+    /// </summary>
+    public enum EventCategory
+    {
+        All = 0,          // Все события
+        HnSwell = 1,      // Перенапряжение Фаза-Нейтраль (H-N Swell)
+        HnSag = 2,        // Провал Фаза-Нейтраль (H-N Sag)
+        HnTransient = 3,  // Высоковольтный импульс Фаза-Нейтраль (H-N Transient)
+        NgSwell = 4,      // Превышение Нейтраль-Земля (N-G Swell)
+        NgTransient = 5,  // Высоковольтный импульс Нейтраль-Земля (N-G Transient)
+        HighFreq = 6,     // Высокая частота сети (High Frequency)
+        LowFreq = 7,      // Низкая частота сети (Low Frequency)
+        Outage = 8,       // Обрыв питания (Outage)
+        OpenOnly = 9      // Только активные незавершенные события (Open Event)
+    }
+
+    /// <summary>
+    /// Главная форма приложения Fluke EventView EV101.
+    /// </summary>
     public partial class Form1 : Form
     {
         private AppLang _lang = AppLang.Ru;
@@ -29,6 +52,7 @@ namespace FlukeEventView
         private float _fontScale = 1.0f;
         private readonly Dictionary<Control, Font> _baseFonts = new Dictionary<Control, Font>();
 
+        // --- ЭЛЕМЕНТЫ ГЛАВНОГО МЕНЮ (MenuStrip) ---
         private MenuStrip _mainMenu;
         private ToolStripMenuItem _mnuFile, _mnuFileOpen, _mnuFileSave, _mnuFileExport, _mnuFileSaveChart, _mnuFileExit;
         private ToolStripMenuItem _mnuView, _mnuViewStatus, _mnuViewEvents, _mnuViewGraphs, _mnuViewTransient, _mnuViewLog;
@@ -43,19 +67,39 @@ namespace FlukeEventView
         private ContextMenuStrip _ctxChartMenu;
         private ToolStripMenuItem _ctxSaveChartImg;
 
+        // --- ПАНЕЛЬ ИНСТРУМЕНТОВ (ToolStrip) ---
         private ToolStrip _toolBar;
         private ToolStripButton _tsbOpen, _tsbSave, _tsbExport, _tsbRefreshPorts;
         private ToolStripButton _tsbFontDec, _tsbFontReset, _tsbFontInc;
         private ToolStripLabel _tslPort, _tslLang;
         private ComboBox _cmbLang;
 
+        // --- СТРОКА СОСТОЯНИЯ (StatusStrip) И ИНДИКАТОРЫ СВЯЗИ ---
         private StatusStrip _statusStrip;
         private ToolStripStatusLabel _lblStatus;
-        private ToolStripStatusLabel _lblPortStatus;
         private ToolStripProgressBar _progressBar;
+        private ToolStripStatusLabel _lblPortStatus;
+        private ToolStripStatusLabel _lblDeviceOnlineLed;
+        private ToolStripStatusLabel _lblTxLed;
+        private ToolStripStatusLabel _lblRxLed;
+
+        private Bitmap _bmpLedGray;
+        private Bitmap _bmpLedYellow;
+        private Bitmap _bmpLedGreenOn;
+        private Bitmap _bmpLedGreenOff;
+        private Bitmap _bmpLedTxOn;
+        private Bitmap _bmpLedTxOff;
+
+        private System.Windows.Forms.Timer _ledBlinkTimer;
+        private volatile int _lastTxTick = -10000;
+        private volatile int _lastRxTick = -10000;
+        private volatile int _lastValidDeviceTick = -10000;
+        private bool _txLedCurrentlyLit = false;
+        private bool _rxLedCurrentlyLit = false;
+
         private ToolTip _toolTip;
 
-        // Главные вкладки
+        // --- ГЛАВНЫЕ ВКЛАДКИ ОКНА ---
         private TabControl _mainTabs;
         private TabPage _tabStatus;
         private TabPage _tabEvents;
@@ -92,12 +136,22 @@ namespace FlukeEventView
         private CheckBox _chkFlashLed;
         private TextBox _txtSiteDesc;
 
-        // Правая колонка: Панель "RealTime" и панель "Recorder Info"
+        // Правая колонка: Панель "RealTime" (Текущее, Мин, Макс за сессию)
+        private Label _lblRtHdrParam, _lblRtHdrCur, _lblRtHdrMin, _lblRtHdrMax;
         private Label _lblRealLineTitle, _lblRealGndTitle, _lblRealFreqTitle;
-        private Label _lblRealLineVolt;
-        private Label _lblRealGndVolt;
-        private Label _lblRealFreq;
 
+        private Label _lblRealLineVolt, _lblMinLineVolt, _lblMaxLineVolt;
+        private Label _lblRealGndVolt, _lblMinGndVolt, _lblMaxGndVolt;
+        private Label _lblRealFreq, _lblMinFreqVal, _lblMaxFreqVal;
+        private Button _btnResetMinMax;
+
+        // Хранение экстремумов (Мин / Макс) за текущую сессию подключения
+        private bool _hasSessionMinMax = false;
+        private double _sessionMinHnVolt, _sessionMaxHnVolt;
+        private double _sessionMinNgVolt, _sessionMaxNgVolt;
+        private double _sessionMinFreq, _sessionMaxFreq;
+
+        // Панель "Recorder Info"
         private Label _lblInfoSerial;
         private Label _lblInfoEventsCount;
         private Label _lblInfoFromDate;
@@ -114,8 +168,21 @@ namespace FlukeEventView
         private Button _btnDefaultSetup;
         private Button _btnReloadInputsRight;
 
-        // Таблица событий (Events Tab), Графики и Лог
+        // --- ЭЛЕМЕНТЫ ВКЛАДКИ "EVENTS" И ПАНЕЛИ ФИЛЬТРАЦИИ ПО ТИПУ И ДАТЕ/ВРЕМЕНИ ---
+        private FlowLayoutPanel _pnlEventsFilter;
+        private Label _lblFilterTitle;
+        private ComboBox _cmbEventFilter;
+        private CheckBox _chkEnableDateFilter;
+        private DateTimePicker _dtpFilterFrom;
+        private Label _lblDateTo;
+        private DateTimePicker _dtpFilterTo;
+        private Button _btnResetFilter;
+        private CheckBox _chkFilterChartsAndCsv;
+        private Label _lblFilterCount;
+        private bool _suppressFilterEvent = false;
         private DataGridView _gridEvents;
+
+        // --- ЭЛЕМЕНТЫ ВКЛАДКИ "GRAPHS" И "LOG" ---
         private Panel _pnlCharts;
         private Label _lblChartStyle;
         private ComboBox _cmbChartType;
@@ -123,7 +190,6 @@ namespace FlukeEventView
         private Label _lblChartHint;
         private TextBox _txtCommLog;
 
-        // Выбранное событие для отрисовки одиночного импульса
         private EventRecord _selectedTransientEvent = null;
 
         // Состояние протокола и фонового сканирования
@@ -136,15 +202,15 @@ namespace FlukeEventView
         private bool _suppressValidation = false;
         private System.Windows.Forms.Timer _scanTimer;
 
-        // Изначально объект пустой (HasValidData = false), никаких статичных серийных номеров нет
         private SiteData _currentSite = new SiteData();
 
         public Form1()
         {
             this.KeyPreview = true;
+            InitLedBitmaps();
             BuildEventViewInterface();
             CaptureBaseFonts(this);
-            InitScanTimer();
+            InitTimers();
             RefreshComPorts();
             ApplyLocalization();
             LogMessage(T("Fluke EventView V2.16 инициализирован.", "Fluke EventView V2.16 initialized."));
@@ -192,17 +258,200 @@ namespace FlukeEventView
 
         private string T(string ru, string en) => _lang == AppLang.Ru ? ru : en;
 
-        private void InitScanTimer()
+        // =========================================================================
+        // УЧЕТ И СБРОС МИНИМАЛЬНЫХ / МАКСИМАЛЬНЫХ ЗНАЧЕНИЙ ЗА СЕССИЮ ПОДКЛЮЧЕНИЯ
+        // =========================================================================
+        private void ResetSessionMinMax()
+        {
+            _hasSessionMinMax = false;
+            _sessionMinHnVolt = _sessionMaxHnVolt = 0;
+            _sessionMinNgVolt = _sessionMaxNgVolt = 0;
+            _sessionMinFreq = _sessionMaxFreq = 0;
+
+            if (_isScanning && _currentSite != null && _currentSite.HasValidData)
+            {
+                UpdateSessionMinMax(_currentSite.LiveHnVolt, _currentSite.LiveNgVolt, _currentSite.LiveFreq);
+            }
+
+            UpdateRealtimeAndInfoPanels(_currentSite);
+        }
+
+        private void UpdateSessionMinMax(double hnVolt, double ngVolt, double freq)
+        {
+            if (!_hasSessionMinMax)
+            {
+                _sessionMinHnVolt = _sessionMaxHnVolt = hnVolt;
+                _sessionMinNgVolt = _sessionMaxNgVolt = ngVolt;
+                _sessionMinFreq = _sessionMaxFreq = freq;
+                _hasSessionMinMax = true;
+            }
+            else
+            {
+                if (hnVolt < _sessionMinHnVolt) _sessionMinHnVolt = hnVolt;
+                if (hnVolt > _sessionMaxHnVolt) _sessionMaxHnVolt = hnVolt;
+
+                if (ngVolt < _sessionMinNgVolt) _sessionMinNgVolt = ngVolt;
+                if (ngVolt > _sessionMaxNgVolt) _sessionMaxNgVolt = ngVolt;
+
+                if (freq > 10.0)
+                {
+                    if (freq < _sessionMinFreq || _sessionMinFreq <= 10.0) _sessionMinFreq = freq;
+                    if (freq > _sessionMaxFreq) _sessionMaxFreq = freq;
+                }
+            }
+        }
+
+        // =========================================================================
+        // ГЕНЕРАЦИЯ СВЕТОДИОДНЫХ ИНДИКАТОРОВ И ОБРАБОТКА МИГАНИЯ TX / RX
+        // =========================================================================
+        private void InitLedBitmaps()
+        {
+            _bmpLedGray = CreateLedBitmap(Color.FromArgb(160, 165, 170), false);
+            _bmpLedYellow = CreateLedBitmap(Color.FromArgb(255, 190, 0), true);
+            _bmpLedGreenOn = CreateLedBitmap(Color.FromArgb(0, 215, 70), true);
+            _bmpLedGreenOff = CreateLedBitmap(Color.FromArgb(45, 95, 55), false);
+            _bmpLedTxOn = CreateLedBitmap(Color.FromArgb(255, 110, 0), true);
+            _bmpLedTxOff = CreateLedBitmap(Color.FromArgb(100, 65, 45), false);
+        }
+
+        private static Bitmap CreateLedBitmap(Color baseColor, bool isLit)
+        {
+            Bitmap bmp = new Bitmap(14, 14);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                Rectangle rect = new Rectangle(1, 1, 11, 11);
+
+                using (SolidBrush fillBrush = new SolidBrush(baseColor))
+                {
+                    g.FillEllipse(fillBrush, rect);
+                }
+
+                if (isLit)
+                {
+                    using (SolidBrush glareBrush = new SolidBrush(Color.FromArgb(150, Color.White)))
+                    {
+                        g.FillEllipse(glareBrush, new Rectangle(3, 2, 5, 4));
+                    }
+                }
+
+                using (Pen borderPen = new Pen(isLit ? Color.FromArgb(60, 60, 60) : Color.FromArgb(110, 110, 110), 1f))
+                {
+                    g.DrawEllipse(borderPen, rect);
+                }
+            }
+            return bmp;
+        }
+
+        private void InitTimers()
         {
             _scanTimer = new System.Windows.Forms.Timer { Interval = 1500 };
             _scanTimer.Tick += async (s, e) => await PollRecorderStatusAsync();
+
+            _ledBlinkTimer = new System.Windows.Forms.Timer { Interval = 80 };
+            _ledBlinkTimer.Tick += OnLedBlinkTimerTick;
+            _ledBlinkTimer.Start();
         }
 
+        private void PulseTxIndicator()
+        {
+            _lastTxTick = Environment.TickCount;
+            if (!IsHandleCreated || IsDisposed) return;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (!_txLedCurrentlyLit && _lblTxLed != null)
+                    {
+                        _txLedCurrentlyLit = true;
+                        _lblTxLed.Image = _bmpLedTxOn;
+                        _lblTxLed.ForeColor = Color.FromArgb(180, 50, 0);
+                    }
+                }));
+            }
+            catch { }
+        }
+
+        private void PulseRxIndicator()
+        {
+            _lastRxTick = Environment.TickCount;
+            if (!IsHandleCreated || IsDisposed) return;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (!_rxLedCurrentlyLit && _lblRxLed != null)
+                    {
+                        _rxLedCurrentlyLit = true;
+                        _lblRxLed.Image = _bmpLedGreenOn;
+                        _lblRxLed.ForeColor = Color.DarkGreen;
+                    }
+                }));
+            }
+            catch { }
+        }
+
+        private void OnLedBlinkTimerTick(object sender, EventArgs e)
+        {
+            int now = Environment.TickCount;
+
+            bool txActive = unchecked((uint)(now - _lastTxTick)) < 160;
+            if (txActive != _txLedCurrentlyLit)
+            {
+                _txLedCurrentlyLit = txActive;
+                _lblTxLed.Image = txActive ? _bmpLedTxOn : _bmpLedTxOff;
+                _lblTxLed.ForeColor = txActive ? Color.FromArgb(180, 50, 0) : Color.DimGray;
+            }
+
+            bool rxActive = unchecked((uint)(now - _lastRxTick)) < 160;
+            if (rxActive != _rxLedCurrentlyLit)
+            {
+                _rxLedCurrentlyLit = rxActive;
+                _lblRxLed.Image = rxActive ? _bmpLedGreenOn : _bmpLedGreenOff;
+                _lblRxLed.ForeColor = rxActive ? Color.DarkGreen : Color.DimGray;
+            }
+
+            UpdateDeviceConnectionLedState(now);
+        }
+
+        private void UpdateDeviceConnectionLedState(int nowTick)
+        {
+            if (_lblDeviceOnlineLed == null) return;
+
+            if (!_isScanning)
+            {
+                _lblDeviceOnlineLed.Image = _bmpLedGray;
+                _lblDeviceOnlineLed.Text = T("Прибор: ОТКЛ", "VR101: OFFLINE");
+                _lblDeviceOnlineLed.ForeColor = Color.DimGray;
+            }
+            else
+            {
+                bool isOnline = unchecked((uint)(nowTick - _lastValidDeviceTick)) < 3200;
+                if (isOnline)
+                {
+                    _lblDeviceOnlineLed.Image = _bmpLedGreenOn;
+                    _lblDeviceOnlineLed.Text = _currentSite.SerialNumber > 0
+                        ? T($"VR101: НА СВЯЗИ (F{_currentSite.SerialNumber})", $"VR101: ONLINE (F{_currentSite.SerialNumber})")
+                        : T("VR101: НА СВЯЗИ", "VR101: ONLINE");
+                    _lblDeviceOnlineLed.ForeColor = Color.DarkGreen;
+                }
+                else
+                {
+                    _lblDeviceOnlineLed.Image = _bmpLedYellow;
+                    _lblDeviceOnlineLed.Text = T("Поиск VR101...", "Waiting VR101...");
+                    _lblDeviceOnlineLed.ForeColor = Color.FromArgb(160, 95, 0);
+                }
+            }
+        }
+
+        // =========================================================================
+        // ПОСТРОЕНИЕ ПОЛЬЗОВАТЕЛЬСКОГО ИНТЕРФЕЙСА
+        // =========================================================================
         private void BuildEventViewInterface()
         {
             this.Text = "Fluke EventView EV101";
-            this.Size = new Size(1420, 820);
-            this.MinimumSize = new Size(1240, 740);
+            this.Size = new Size(1460, 850);
+            this.MinimumSize = new Size(1260, 740);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("MS Sans Serif", 8.25f);
 
@@ -311,14 +560,12 @@ namespace FlukeEventView
             };
             _toolBar.Items.Add(new ToolStripControlHost(_btnDownloadEvents));
 
-            // Кнопки управления размером шрифта (A-, 100%, A+)
             _toolBar.Items.Add(new ToolStripSeparator());
             _tsbFontDec = new ToolStripButton("🔉 A-", null, (s, e) => ChangeFontScale(-0.10f)) { Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold) };
             _tsbFontReset = new ToolStripButton("100%", null, (s, e) => ResetFontScale());
             _tsbFontInc = new ToolStripButton("🔊 A+", null, (s, e) => ChangeFontScale(0.10f)) { Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold) };
             _toolBar.Items.AddRange(new ToolStripItem[] { _tsbFontDec, _tsbFontReset, _tsbFontInc });
 
-            // Переключатель языка
             _toolBar.Items.Add(new ToolStripSeparator());
             _tslLang = new ToolStripLabel("🌐");
             _toolBar.Items.Add(_tslLang);
@@ -332,14 +579,64 @@ namespace FlukeEventView
             };
             _toolBar.Items.Add(new ToolStripControlHost(_cmbLang));
 
-            // 3. Статус-бар
-            _statusStrip = new StatusStrip();
+            // 3. Строка состояния (StatusStrip) со светодиодными индикаторами
+            _statusStrip = new StatusStrip { SizingGrip = false, Padding = new Padding(4, 2, 10, 2) };
             _lblStatus = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-            _progressBar = new ToolStripProgressBar { Width = 160, Visible = false };
-            _lblPortStatus = new ToolStripStatusLabel { BorderSides = ToolStripStatusLabelBorderSides.Left };
-            _statusStrip.Items.AddRange(new ToolStripItem[] { _lblStatus, _progressBar, _lblPortStatus });
+            _progressBar = new ToolStripProgressBar { Width = 150, Visible = false };
 
-            // 4. Вкладки Site Report Window
+            _lblPortStatus = new ToolStripStatusLabel
+            {
+                BorderSides = ToolStripStatusLabelBorderSides.Left,
+                Padding = new Padding(8, 0, 8, 0)
+            };
+
+            _lblDeviceOnlineLed = new ToolStripStatusLabel
+            {
+                Image = _bmpLedGray,
+                ImageScaling = ToolStripItemImageScaling.None,
+                TextImageRelation = TextImageRelation.ImageBeforeText,
+                BorderSides = ToolStripStatusLabelBorderSides.Left,
+                Padding = new Padding(8, 0, 8, 0),
+                Font = new Font("MS Sans Serif", 8.25f, FontStyle.Bold),
+                ForeColor = Color.DimGray,
+                Text = "Прибор: ОТКЛ"
+            };
+
+            _lblTxLed = new ToolStripStatusLabel
+            {
+                Image = _bmpLedTxOff,
+                ImageScaling = ToolStripItemImageScaling.None,
+                TextImageRelation = TextImageRelation.ImageBeforeText,
+                BorderSides = ToolStripStatusLabelBorderSides.Left,
+                Padding = new Padding(8, 0, 6, 0),
+                Font = new Font("Consolas", 9f, FontStyle.Bold),
+                ForeColor = Color.DimGray,
+                Text = "TX"
+            };
+
+            _lblRxLed = new ToolStripStatusLabel
+            {
+                Image = _bmpLedGreenOff,
+                ImageScaling = ToolStripItemImageScaling.None,
+                TextImageRelation = TextImageRelation.ImageBeforeText,
+                BorderSides = ToolStripStatusLabelBorderSides.Left,
+                Padding = new Padding(6, 0, 8, 0),
+                Font = new Font("Consolas", 9f, FontStyle.Bold),
+                ForeColor = Color.DimGray,
+                Text = "RX"
+            };
+
+            _statusStrip.Items.AddRange(new ToolStripItem[]
+            {
+                _lblStatus,
+                _progressBar,
+                _lblPortStatus,
+                _lblDeviceOnlineLed,
+                _lblTxLed,
+                _lblRxLed
+            });
+
+            // 4. Вкладки главного окна
             _mainTabs = new TabControl { Dock = DockStyle.Fill, Font = new Font("MS Sans Serif", 9f, FontStyle.Regular) };
             _tabStatus = new TabPage();
             _tabEvents = new TabPage();
@@ -377,14 +674,14 @@ namespace FlukeEventView
             _splitStatus = new SplitContainer
             {
                 Dock = DockStyle.Fill,
-                SplitterDistance = 740,
+                SplitterDistance = 720,
                 FixedPanel = FixedPanel.Panel1,
                 Padding = new Padding(6)
             };
 
             var pnlLeft = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
 
-            // 1. Hot to Neutral Thresholds (H-N)
+            // 1. Пороги Фаза — Нейтраль (H-N)
             _grpHn = new GroupBox { Dock = DockStyle.Top, Height = 132, Padding = new Padding(10) };
             _tblHn = CreateSettingsTable(3);
             _numHnSwell = CreateValidatedNum(100, 300, 256, 2, 0);
@@ -396,7 +693,7 @@ namespace FlukeEventView
             _lblHnTransTitle = AddRowWithLabelRef(_tblHn, 2, "", _numHnTransient);
             _grpHn.Controls.Add(_tblHn);
 
-            // 2. Neutral to Ground Thresholds (N-G)
+            // 2. Пороги Нейтраль — Земля (N-G)
             _grpNg = new GroupBox { Dock = DockStyle.Top, Height = 100, Padding = new Padding(10) };
             _tblNg = CreateSettingsTable(2);
             _numNgSwell = CreateValidatedNum(1, 250, 10, 1, 0);
@@ -406,7 +703,7 @@ namespace FlukeEventView
             _lblNgTransTitle = AddRowWithLabelRef(_tblNg, 1, "", _numNgTransient);
             _grpNg.Controls.Add(_tblNg);
 
-            // 3. Frequency Thresholds
+            // 3. Пороги частоты сети
             _grpFreq = new GroupBox { Dock = DockStyle.Top, Height = 132, Padding = new Padding(10) };
             _tblFreq = CreateSettingsTable(3);
 
@@ -438,7 +735,7 @@ namespace FlukeEventView
             _lblMinFreqTitle = AddRowWithLabelRef(_tblFreq, 2, "", _numMinFreq);
             _grpFreq.Controls.Add(_tblFreq);
 
-            // 4. Options
+            // 4. Опции
             _grpOpt = new GroupBox { Dock = DockStyle.Top, Height = 112, Padding = new Padding(10) };
             var pnlOpt = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
             _rbStopFull = new RadioButton { AutoSize = true };
@@ -447,7 +744,7 @@ namespace FlukeEventView
             pnlOpt.Controls.AddRange(new Control[] { _rbStopFull, _rbFifo, _chkFlashLed });
             _grpOpt.Controls.Add(pnlOpt);
 
-            // 5. Site Description (по умолчанию пусто до чтения прибора или ввода пользователем)
+            // 5. Описание объекта
             _grpDesc = new GroupBox { Dock = DockStyle.Top, Height = 72, Padding = new Padding(10) };
             _txtSiteDesc = new TextBox { Text = "", MaxLength = 30, Dock = DockStyle.Top };
             _grpDesc.Controls.Add(_txtSiteDesc);
@@ -459,31 +756,91 @@ namespace FlukeEventView
             pnlLeft.Controls.Add(_grpHn);
             _splitStatus.Panel1.Controls.Add(pnlLeft);
 
-            // --- ПРАВАЯ ПАНЕЛЬ: REALTIME, RECORDER INFO И КНОПКИ ---
+            // --- ПРАВАЯ ПАНЕЛЬ: REALTIME (БЕЗ РАМОК, ЕДИНЫЙ ЦВЕТ СТОЛБЦОВ), RECORDER INFO И КНОПКИ ---
             var pnlRight = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
 
-            // 1. Панель "RealTime"
             _grpRealTime = new GroupBox
             {
                 Dock = DockStyle.Top,
-                Height = 148,
+                Height = 200,
                 Padding = new Padding(10),
                 ForeColor = Color.DarkRed
             };
-            _tblReal = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
-            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 240));
-            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int r = 0; r < 3; r++) _tblReal.RowStyles.Add(new RowStyle(SizeType.Percent, 33.3f));
 
-            var rtFont = new Font("Consolas", 12f, FontStyle.Bold);
-            _lblRealLineVolt = new Label { Text = "---", AutoSize = true, Font = rtFont, ForeColor = Color.DarkGreen, Anchor = AnchorStyles.Left };
-            _lblRealGndVolt = new Label { Text = "---", AutoSize = true, Font = rtFont, ForeColor = Color.Teal, Anchor = AnchorStyles.Left };
-            _lblRealFreq = new Label { Text = "---", AutoSize = true, Font = rtFont, ForeColor = Color.DarkBlue, Anchor = AnchorStyles.Left };
+            _tblReal = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 4,
+                RowCount = 4,
+                CellBorderStyle = TableLayoutPanelCellBorderStyle.None
+            };
+            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40f));
+            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
+            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
+            _tblReal.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f));
+            _tblReal.RowStyles.Add(new RowStyle(SizeType.Percent, 22f));
+            _tblReal.RowStyles.Add(new RowStyle(SizeType.Percent, 26f));
+            _tblReal.RowStyles.Add(new RowStyle(SizeType.Percent, 26f));
+            _tblReal.RowStyles.Add(new RowStyle(SizeType.Percent, 26f));
 
-            _lblRealLineTitle = AddRowWithLabelRef(_tblReal, 0, "", _lblRealLineVolt);
-            _lblRealGndTitle = AddRowWithLabelRef(_tblReal, 1, "", _lblRealGndVolt);
-            _lblRealFreqTitle = AddRowWithLabelRef(_tblReal, 2, "", _lblRealFreq);
+            var hdrFont = new Font("MS Sans Serif", 8.25f, FontStyle.Bold);
+            _lblRtHdrParam = CreateCellLabel("", hdrFont, Color.DimGray, ContentAlignment.MiddleLeft);
+            _lblRtHdrCur = CreateCellLabel("", hdrFont, Color.DarkGreen, ContentAlignment.MiddleCenter);
+            _lblRtHdrMin = CreateCellLabel("", hdrFont, Color.DarkSlateBlue, ContentAlignment.MiddleCenter);
+            _lblRtHdrMax = CreateCellLabel("", hdrFont, Color.DarkRed, ContentAlignment.MiddleCenter);
+
+            _tblReal.Controls.Add(_lblRtHdrParam, 0, 0);
+            _tblReal.Controls.Add(_lblRtHdrCur, 1, 0);
+            _tblReal.Controls.Add(_lblRtHdrMin, 2, 0);
+            _tblReal.Controls.Add(_lblRtHdrMax, 3, 0);
+
+            var rtCurFont = new Font("Consolas", 11f, FontStyle.Bold);
+            var rtExtFont = new Font("Consolas", 10f, FontStyle.Bold);
+            var rowTitleFont = new Font("MS Sans Serif", 8.5f, FontStyle.Regular);
+
+            _lblRealLineTitle = CreateCellLabel("", rowTitleFont, Color.Black, ContentAlignment.MiddleLeft);
+            _lblRealLineVolt = CreateCellLabel("---", rtCurFont, Color.DarkGreen, ContentAlignment.MiddleCenter);
+            _lblMinLineVolt = CreateCellLabel("---", rtExtFont, Color.DarkSlateBlue, ContentAlignment.MiddleCenter);
+            _lblMaxLineVolt = CreateCellLabel("---", rtExtFont, Color.DarkRed, ContentAlignment.MiddleCenter);
+
+            _lblRealGndTitle = CreateCellLabel("", rowTitleFont, Color.Black, ContentAlignment.MiddleLeft);
+            _lblRealGndVolt = CreateCellLabel("---", rtCurFont, Color.DarkGreen, ContentAlignment.MiddleCenter);
+            _lblMinGndVolt = CreateCellLabel("---", rtExtFont, Color.DarkSlateBlue, ContentAlignment.MiddleCenter);
+            _lblMaxGndVolt = CreateCellLabel("---", rtExtFont, Color.DarkRed, ContentAlignment.MiddleCenter);
+
+            _lblRealFreqTitle = CreateCellLabel("", rowTitleFont, Color.Black, ContentAlignment.MiddleLeft);
+            _lblRealFreq = CreateCellLabel("---", rtCurFont, Color.DarkGreen, ContentAlignment.MiddleCenter);
+            _lblMinFreqVal = CreateCellLabel("---", rtExtFont, Color.DarkSlateBlue, ContentAlignment.MiddleCenter);
+            _lblMaxFreqVal = CreateCellLabel("---", rtExtFont, Color.DarkRed, ContentAlignment.MiddleCenter);
+
+            _tblReal.Controls.Add(_lblRealLineTitle, 0, 1);
+            _tblReal.Controls.Add(_lblRealLineVolt, 1, 1);
+            _tblReal.Controls.Add(_lblMinLineVolt, 2, 1);
+            _tblReal.Controls.Add(_lblMaxLineVolt, 3, 1);
+
+            _tblReal.Controls.Add(_lblRealGndTitle, 0, 2);
+            _tblReal.Controls.Add(_lblRealGndVolt, 1, 2);
+            _tblReal.Controls.Add(_lblMinGndVolt, 2, 2);
+            _tblReal.Controls.Add(_lblMaxGndVolt, 3, 2);
+
+            _tblReal.Controls.Add(_lblRealFreqTitle, 0, 3);
+            _tblReal.Controls.Add(_lblRealFreq, 1, 3);
+            _tblReal.Controls.Add(_lblMinFreqVal, 2, 3);
+            _tblReal.Controls.Add(_lblMaxFreqVal, 3, 3);
+
+            _btnResetMinMax = new Button
+            {
+                Dock = DockStyle.Bottom,
+                Height = 26,
+                FlatStyle = FlatStyle.Standard,
+                BackColor = Color.FromArgb(240, 244, 248),
+                ForeColor = Color.Black,
+                Font = new Font("MS Sans Serif", 8.25f, FontStyle.Regular)
+            };
+            _btnResetMinMax.Click += (s, e) => ResetSessionMinMax();
+
             _grpRealTime.Controls.Add(_tblReal);
+            _grpRealTime.Controls.Add(_btnResetMinMax);
 
             // 2. Панель "Recorder Info"
             _grpRecInfo = new GroupBox
@@ -546,6 +903,20 @@ namespace FlukeEventView
             page.Controls.Add(_splitStatus);
         }
 
+        private static Label CreateCellLabel(string text, Font font, Color foreColor, ContentAlignment align)
+        {
+            return new Label
+            {
+                Text = text,
+                Font = font,
+                ForeColor = foreColor,
+                TextAlign = align,
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                Margin = new Padding(3, 1, 3, 1)
+            };
+        }
+
         private static TableLayoutPanel CreateSettingsTable(int rowCount)
         {
             var tbl = new TableLayoutPanel
@@ -561,8 +932,158 @@ namespace FlukeEventView
             return tbl;
         }
 
+        /// <summary>
+        /// Строит вкладку "События (Events)" с панелью фильтрации по типу и интервалу дат/времени (с ... по ...).
+        /// </summary>
         private void BuildEventsTab(TabPage page)
         {
+            // 1. Панель фильтрации событий (автоматически переносит элементы при увеличении шрифта)
+            _pnlEventsFilter = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                MinimumSize = new Size(0, 42),
+                Padding = new Padding(8, 6, 8, 6),
+                BackColor = Color.FromArgb(240, 244, 248),
+                WrapContents = true
+            };
+
+            _lblFilterTitle = new Label
+            {
+                AutoSize = true,
+                Margin = new Padding(2, 6, 4, 2),
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold),
+                ForeColor = Color.Black
+            };
+
+            _cmbEventFilter = new ComboBox
+            {
+                Width = 260,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Margin = new Padding(0, 2, 12, 2),
+                Font = new Font("MS Sans Serif", 9f, FontStyle.Regular)
+            };
+            for (int i = 0; i < 10; i++) _cmbEventFilter.Items.Add(i.ToString());
+            _cmbEventFilter.SelectedIndex = 0;
+            _cmbEventFilter.SelectedIndexChanged += (s, e) =>
+            {
+                if (_suppressFilterEvent) return;
+                PopulateEventsGrid(_currentSite);
+            };
+
+            // Фильтр по интервалу дат и времени: "[x] Период с: [dd.MM.yyyy HH:mm:ss] по: [dd.MM.yyyy HH:mm:ss]"
+            _chkEnableDateFilter = new CheckBox
+            {
+                AutoSize = true,
+                Checked = false,
+                Margin = new Padding(4, 5, 4, 2),
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold),
+                ForeColor = Color.DarkSlateBlue
+            };
+            _chkEnableDateFilter.CheckedChanged += (s, e) =>
+            {
+                _dtpFilterFrom.Enabled = _chkEnableDateFilter.Checked;
+                _dtpFilterTo.Enabled = _chkEnableDateFilter.Checked;
+                if (_suppressFilterEvent) return;
+                PopulateEventsGrid(_currentSite);
+            };
+
+            _dtpFilterFrom = new DateTimePicker
+            {
+                Width = 155,
+                Format = DateTimePickerFormat.Custom,
+                CustomFormat = "dd.MM.yyyy HH:mm:ss",
+                Enabled = false,
+                Margin = new Padding(0, 2, 4, 2),
+                Font = new Font("Consolas", 9f, FontStyle.Regular)
+            };
+            _dtpFilterFrom.ValueChanged += (s, e) =>
+            {
+                if (_suppressFilterEvent) return;
+                PopulateEventsGrid(_currentSite);
+            };
+
+            _lblDateTo = new Label
+            {
+                AutoSize = true,
+                Margin = new Padding(2, 6, 4, 2),
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold),
+                ForeColor = Color.DarkSlateBlue
+            };
+
+            _dtpFilterTo = new DateTimePicker
+            {
+                Width = 155,
+                Format = DateTimePickerFormat.Custom,
+                CustomFormat = "dd.MM.yyyy HH:mm:ss",
+                Enabled = false,
+                Margin = new Padding(0, 2, 12, 2),
+                Font = new Font("Consolas", 9f, FontStyle.Regular)
+            };
+            _dtpFilterTo.ValueChanged += (s, e) =>
+            {
+                if (_suppressFilterEvent) return;
+                PopulateEventsGrid(_currentSite);
+            };
+
+            _btnResetFilter = new Button
+            {
+                Width = 120,
+                Height = 25,
+                Margin = new Padding(0, 1, 12, 2),
+                BackColor = Color.WhiteSmoke,
+                Font = new Font("MS Sans Serif", 8.25f, FontStyle.Regular)
+            };
+            _btnResetFilter.Click += (s, e) =>
+            {
+                _suppressFilterEvent = true;
+                try
+                {
+                    _cmbEventFilter.SelectedIndex = 0;
+                    _chkEnableDateFilter.Checked = false;
+                    _dtpFilterFrom.Enabled = false;
+                    _dtpFilterTo.Enabled = false;
+                    SyncFilterDatePickersFromSite(_currentSite);
+                }
+                finally
+                {
+                    _suppressFilterEvent = false;
+                }
+                PopulateEventsGrid(_currentSite);
+            };
+
+            _chkFilterChartsAndCsv = new CheckBox
+            {
+                AutoSize = true,
+                Checked = true,
+                Margin = new Padding(0, 5, 14, 2),
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Regular),
+                ForeColor = Color.Black
+            };
+            _chkFilterChartsAndCsv.CheckedChanged += (s, e) => _pnlCharts?.Invalidate();
+
+            _lblFilterCount = new Label
+            {
+                AutoSize = true,
+                Margin = new Padding(4, 6, 0, 2),
+                Font = new Font("MS Sans Serif", 9f, FontStyle.Bold),
+                ForeColor = Color.DarkBlue
+            };
+
+            _pnlEventsFilter.Controls.AddRange(new Control[]
+            {
+                _lblFilterTitle,
+                _cmbEventFilter,
+                _chkEnableDateFilter,
+                _dtpFilterFrom,
+                _lblDateTo,
+                _dtpFilterTo,
+                _btnResetFilter,
+                _chkFilterChartsAndCsv,
+                _lblFilterCount
+            });
+
+            // 2. Таблица событий (DataGridView)
             _gridEvents = new DataGridView
             {
                 Dock = DockStyle.Fill,
@@ -611,6 +1132,129 @@ namespace FlukeEventView
             };
 
             page.Controls.Add(_gridEvents);
+            page.Controls.Add(_pnlEventsFilter);
+        }
+
+        // =========================================================================
+        // ЛОГИКА ФИЛЬТРАЦИИ СОБЫТИЙ ПО ТИПУ И ИНТЕРВАЛУ ДАТ / ВРЕМЕНИ
+        // =========================================================================
+
+        /// <summary>
+        /// Синхронизирует начальные значения полей DateTimePicker ("с" и "по") с реальным временем начала
+        /// и окончания загруженной сессии прибора.
+        /// </summary>
+        private void SyncFilterDatePickersFromSite(SiteData s)
+        {
+            if (s == null || !s.HasValidData || _dtpFilterFrom == null || _dtpFilterTo == null)
+                return;
+
+            bool prevSuppress = _suppressFilterEvent;
+            _suppressFilterEvent = true;
+            try
+            {
+                DateTime minDt = s.StartTime;
+                DateTime maxDt = s.EndTime;
+
+                if (s.Events.Count > 0)
+                {
+                    DateTime evMin = s.Events.Min(e => e.Timestamp);
+                    DateTime evMax = s.Events.Max(e => e.Timestamp);
+                    if (evMin < minDt) minDt = evMin;
+                    if (evMax > maxDt) maxDt = evMax;
+                }
+
+                if (s.OpenEvents.Count > 0)
+                {
+                    DateTime opMin = s.OpenEvents.Min(e => e.Timestamp);
+                    DateTime opMax = s.OpenEvents.Max(e => e.Timestamp);
+                    if (opMin < minDt) minDt = opMin;
+                    if (opMax > maxDt) maxDt = opMax;
+                }
+
+                if (minDt < _dtpFilterFrom.MinDate) minDt = _dtpFilterFrom.MinDate;
+                if (maxDt > _dtpFilterTo.MaxDate) maxDt = _dtpFilterTo.MaxDate;
+                if (maxDt < minDt) maxDt = minDt;
+
+                _dtpFilterFrom.Value = minDt;
+                _dtpFilterTo.Value = maxDt;
+            }
+            catch { }
+            finally
+            {
+                _suppressFilterEvent = prevSuppress;
+            }
+        }
+
+        /// <summary>
+        /// Возвращает текущую выбранную категорию фильтра по типу события.
+        /// </summary>
+        private EventCategory GetSelectedFilterCategory()
+        {
+            if (_cmbEventFilter == null || _cmbEventFilter.SelectedIndex < 0)
+                return EventCategory.All;
+            return (EventCategory)_cmbEventFilter.SelectedIndex;
+        }
+
+        /// <summary>
+        /// Проверяет, проходит ли событие через фильтр по типу помехи И фильтр по интервалу дат/времени.
+        /// </summary>
+        private bool MatchesEventFilter(EventRecord ev)
+        {
+            if (ev == null) return false;
+
+            // 1. Проверка фильтра по типу события
+            EventCategory cat = GetSelectedFilterCategory();
+            if (cat == EventCategory.OpenOnly)
+            {
+                if (!ev.IsOpenEvent) return false;
+            }
+            else if (cat != EventCategory.All)
+            {
+                if (ev.Category != cat) return false;
+            }
+
+            // 2. Проверка фильтра по интервалу дат и времени (если включен чекбокс "Период с ... по ...")
+            if (_chkEnableDateFilter != null && _chkEnableDateFilter.Checked)
+            {
+                DateTime fromTime = _dtpFilterFrom.Value;
+                DateTime toTime = _dtpFilterTo.Value;
+                if (fromTime > toTime)
+                {
+                    DateTime tmp = fromTime;
+                    fromTime = toTime;
+                    toTime = tmp;
+                }
+
+                if (ev.Timestamp < fromTime || ev.Timestamp > toTime)
+                    return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        ///Проверяет, активен ли хотя бы один из фильтров (по типу или по времени).
+        /// </summary>
+        private bool IsAnyFilterActive()
+        {
+            return GetSelectedFilterCategory() != EventCategory.All ||
+                   (_chkEnableDateFilter != null && _chkEnableDateFilter.Checked);
+        }
+
+        /// <summary>
+        /// Возвращает список завершенных событий для построения графиков и экспорта с учетом активных фильтров.
+        /// </summary>
+        private List<EventRecord> GetEventsForChartsAndExport()
+        {
+            if (_currentSite == null || !_currentSite.HasValidData)
+                return new List<EventRecord>();
+
+            if (_chkFilterChartsAndCsv != null && _chkFilterChartsAndCsv.Checked && IsAnyFilterActive())
+            {
+                return _currentSite.Events.Where(MatchesEventFilter).ToList();
+            }
+
+            return _currentSite.Events;
         }
 
         private void BuildChartsTab(TabPage page)
@@ -751,18 +1395,24 @@ namespace FlukeEventView
                     }
                 }
 
+                if (_dtpFilterFrom != null && _dtpFilterTo != null)
+                {
+                    int dtpWidth = (int)Math.Round(155 * Math.Max(1.0f, _fontScale * 0.95f));
+                    _dtpFilterFrom.Width = dtpWidth;
+                    _dtpFilterTo.Width = dtpWidth;
+                }
+
                 int labelColWidth = (int)Math.Round(450 * Math.Max(1.0f, _fontScale * 0.96f));
                 if (_tblHn != null) _tblHn.ColumnStyles[0].Width = labelColWidth;
                 if (_tblNg != null) _tblNg.ColumnStyles[0].Width = labelColWidth;
                 if (_tblFreq != null) _tblFreq.ColumnStyles[0].Width = labelColWidth;
-                if (_tblReal != null) _tblReal.ColumnStyles[0].Width = (int)Math.Round(240 * Math.Max(1.0f, _fontScale));
 
                 if (_grpHn != null) _grpHn.Height = (int)Math.Round(132 * Math.Max(1.0f, _fontScale * 0.95f));
                 if (_grpNg != null) _grpNg.Height = (int)Math.Round(100 * Math.Max(1.0f, _fontScale * 0.95f));
                 if (_grpFreq != null) _grpFreq.Height = (int)Math.Round(132 * Math.Max(1.0f, _fontScale * 0.95f));
                 if (_grpOpt != null) _grpOpt.Height = (int)Math.Round(112 * Math.Max(1.0f, _fontScale * 0.98f));
                 if (_grpDesc != null) _grpDesc.Height = (int)Math.Round(72 * Math.Max(1.0f, _fontScale * 0.98f));
-                if (_grpRealTime != null) _grpRealTime.Height = (int)Math.Round(148 * Math.Max(1.0f, _fontScale * 0.95f));
+                if (_grpRealTime != null) _grpRealTime.Height = (int)Math.Round(200 * Math.Max(1.0f, _fontScale * 0.96f));
                 if (_grpRecInfo != null) _grpRecInfo.Height = (int)Math.Round(205 * Math.Max(1.0f, _fontScale));
                 if (_grpButtons != null) _grpButtons.Height = (int)Math.Round(175 * Math.Max(1.0f, _fontScale * 0.95f));
 
@@ -785,8 +1435,8 @@ namespace FlukeEventView
         private void AdjustStatusSplitterForScale()
         {
             if (_splitStatus == null || _splitStatus.Width < 800) return;
-            int targetLeftWidth = (int)Math.Round(740 * Math.Max(1.0f, _fontScale * 0.95f));
-            targetLeftWidth = Math.Min(_splitStatus.Width - 380, Math.Max(680, targetLeftWidth));
+            int targetLeftWidth = (int)Math.Round(710 * Math.Max(1.0f, _fontScale * 0.95f));
+            targetLeftWidth = Math.Min(_splitStatus.Width - 460, Math.Max(660, targetLeftWidth));
             _splitStatus.SplitterDistance = targetLeftWidth;
         }
 
@@ -981,6 +1631,13 @@ namespace FlukeEventView
             _tsbFontInc.ToolTipText = T("Увеличить размер шрифта (Ctrl + Плюс / Ctrl + Колесо мыши)", "Increase font size (Ctrl + Plus / Ctrl + Mouse Wheel)");
             _tslLang.Text = T("🌐 Язык:", "🌐 Lang:");
 
+            // Подсказки для индикаторов связи
+            _lblDeviceOnlineLed.ToolTipText = T(
+                "Индикатор связи с прибором Fluke VR101 (Зеленый — прибор отвечает, Желтый — ожидание ответа, Серый — порт закрыт)",
+                "Fluke VR101 link status (Green = device responding, Yellow = scanning/waiting, Gray = port closed)");
+            _lblTxLed.ToolTipText = T("Передача данных в прибор (TX)", "Transmitting data to recorder (TX)");
+            _lblRxLed.ToolTipText = T("Прием данных от прибора (RX)", "Receiving data from recorder (RX)");
+
             // Вкладки
             _tabStatus.Text = T("Статус и Уставки (Status)", "Status (Setup & RealTime)");
             _tabEvents.Text = T("События (Events)", "Events (SiteGrid)");
@@ -1003,11 +1660,20 @@ namespace FlukeEventView
                 "Описание объекта (до 30 символов латиницей/ASCII). Считывается и записывается в память прибора.",
                 "Site description (up to 30 ASCII characters). Read from and stored in recorder memory."));
 
-            // Правая панель Status
-            _grpRealTime.Text = T("Текущие показания в реальном времени (RealTime)", "RealTime");
-            _lblRealLineTitle.Text = T("Напряжение Фаза-Нейтраль (Vrms):", "Line Voltage (Vrms):");
-            _lblRealGndTitle.Text = T("Напряжение Нейтраль-Земля (Vrms):", "Ground Voltage (Vrms):");
-            _lblRealFreqTitle.Text = T("Частота сети (Hz):", "Line Frequency (Hz):");
+            // Правая панель Status: RealTime с учетом Мин/Макс за сессию
+            _grpRealTime.Text = T("Текущие показания в реальном времени и экстремумы за сессию (RealTime)", "RealTime Readings & Session Min / Max");
+            _lblRtHdrParam.Text = T("Параметр сети", "Parameter");
+            _lblRtHdrCur.Text = T("Текущее", "Current");
+            _lblRtHdrMin.Text = T("Мин. (Min)", "Min");
+            _lblRtHdrMax.Text = T("Макс. (Max)", "Max");
+
+            _lblRealLineTitle.Text = T("Фаза-Нейтраль (Vrms):", "Line H-N (Vrms):");
+            _lblRealGndTitle.Text = T("Нейтраль-Земля (Vrms):", "Ground N-G (Vrms):");
+            _lblRealFreqTitle.Text = T("Частота сети (Hz):", "Frequency (Hz):");
+            _btnResetMinMax.Text = T("↺ Сбросить Мин / Макс за сессию", "↺ Reset Session Min / Max");
+            _toolTip.SetToolTip(_btnResetMinMax, T(
+                "Обнулить накопленные минимальные и максимальные значения за текущий сеанс связи с прибором.",
+                "Reset recorded minimum and maximum values for the current connection session."));
 
             _grpRecInfo.Text = T("Информация о регистраторе (Recorder Info)", "Recorder Info");
             _grpButtons.Text = T("Команды управления регистратором", "Recorder Setup Commands");
@@ -1016,7 +1682,34 @@ namespace FlukeEventView
             _btnReloadInputsRight.Text = T("Прочитать текущие уставки из прибора", "Read Current Setup from Recorder");
             _btnDefaultSetup.Text = T("Заводские уставки по умолчанию (220V / 50Hz)", "Default Setup (220V / 50Hz)");
 
-            // Таблица событий
+            // Панель фильтрации по типу и интервалу дат/времени (Events Tab)
+            _lblFilterTitle.Text = T("Тип:", "Type:");
+            _chkEnableDateFilter.Text = T("Период с:", "Period from:");
+            _lblDateTo.Text = T("по:", "to:");
+            _btnResetFilter.Text = T("Показать все", "Show All");
+            _chkFilterChartsAndCsv.Text = T("Учитывать на графиках и в CSV", "Apply to Graphs & CSV");
+
+            _suppressFilterEvent = true;
+            try
+            {
+                int selFilter = _cmbEventFilter.SelectedIndex >= 0 ? _cmbEventFilter.SelectedIndex : 0;
+                _cmbEventFilter.Items[0] = T("Все типы событий (All Events)", "All Events");
+                _cmbEventFilter.Items[1] = T("Перенапряжение H-N (H-N Swell)", "H-N Swell");
+                _cmbEventFilter.Items[2] = T("Провал напряжения H-N (H-N Sag)", "H-N Sag");
+                _cmbEventFilter.Items[3] = T("Импульсы Фаза-Нейтраль (H-N Transients)", "H-N Transients");
+                _cmbEventFilter.Items[4] = T("Превышение Нейтраль-Земля (N-G Swell)", "N-G Swell");
+                _cmbEventFilter.Items[5] = T("Импульсы Нейтраль-Земля (N-G Transients)", "N-G Transients");
+                _cmbEventFilter.Items[6] = T("Высокая частота (High Frequency)", "High Frequency");
+                _cmbEventFilter.Items[7] = T("Низкая частота (Low Frequency)", "Low Frequency");
+                _cmbEventFilter.Items[8] = T("Обрыв питания (Outage)", "Outage");
+                _cmbEventFilter.Items[9] = T("Только активные события (Open Events)", "Open Events Only");
+                _cmbEventFilter.SelectedIndex = selFilter;
+            }
+            finally
+            {
+                _suppressFilterEvent = false;
+            }
+
             _gridEvents.Columns[0].HeaderText = T("№", "Event");
             _gridEvents.Columns[1].HeaderText = T("Время начала", "Start Time");
             _gridEvents.Columns[2].HeaderText = T("Тип события", "Event");
@@ -1039,6 +1732,7 @@ namespace FlukeEventView
 
             ConfigureHardwareLimitsAndTooltips(_currentSite.Is220V, _rb50Hz.Checked, _currentSite.NgScale025);
             UpdateControlStates();
+            UpdateDeviceConnectionLedState(Environment.TickCount);
             UpdateRealtimeAndInfoPanels(_currentSite);
             PopulateEventsGrid(_currentSite);
         }
@@ -1312,6 +2006,7 @@ namespace FlukeEventView
             if (_isScanning) StopScanningPort();
             else StartScanningPort();
             UpdateControlStates();
+            UpdateDeviceConnectionLedState(Environment.TickCount);
         }
 
         private void StartScanningPort()
@@ -1338,8 +2033,9 @@ namespace FlukeEventView
                 _isScanning = true;
                 _initialSetupLoadedFromDevice = false;
                 _eventsDownloadedForCurrentSession = false;
+                _lastValidDeviceTick = -10000;
 
-                // До получения первого ответа от прибора очищаем данные прошлой сессии
+                _hasSessionMinMax = false;
                 _currentSite = new SiteData();
                 UpdateRealtimeAndInfoPanels(_currentSite);
 
@@ -1361,6 +2057,8 @@ namespace FlukeEventView
             _scanTimer.Stop();
             _isScanning = false;
             _initialSetupLoadedFromDevice = false;
+            _lastValidDeviceTick = -10000;
+            _hasSessionMinMax = false;
 
             lock (_portLock)
             {
@@ -1376,10 +2074,7 @@ namespace FlukeEventView
                 catch { }
             }
 
-            // При разрыве связи сбрасываем живые показания в прочерки
-            _lblRealLineVolt.Text = "---";
-            _lblRealGndVolt.Text = "---";
-            _lblRealFreq.Text = "---";
+            UpdateRealtimeAndInfoPanels(_currentSite);
             LogMessage("Scanning stopped. Port closed.");
         }
 
@@ -1394,7 +2089,8 @@ namespace FlukeEventView
                 _btnReloadInputsRight.Enabled = true;
                 _btnDownloadEvents.Enabled = true;
                 _btnSendSetupClear.Enabled = true;
-                _lblPortStatus.Text = T($"Опрос: ВКЛ ({_serialPort?.PortName})", $"Scanning: ON ({_serialPort?.PortName})");
+                _btnResetMinMax.Enabled = true;
+                _lblPortStatus.Text = T($"Порт: {_serialPort?.PortName}", $"Port: {_serialPort?.PortName}");
                 _lblStatus.Text = T("Опрос активен. Ожидание ответа от регистратора VR101...", "Scanning active. Waiting for VR101 response...");
             }
             else
@@ -1406,7 +2102,8 @@ namespace FlukeEventView
                 _btnReloadInputsRight.Enabled = false;
                 _btnDownloadEvents.Enabled = false;
                 _btnSendSetupClear.Enabled = false;
-                _lblPortStatus.Text = T("Опрос: ВЫКЛ", "Scanning: OFF");
+                _btnResetMinMax.Enabled = false;
+                _lblPortStatus.Text = T("Порт: ЗАКРЫТ", "Port: CLOSED");
                 _lblStatus.Text = T("Опрос отключен. Подключите порт для чтения параметров устройства.", "Scanning OFF. Connect port to read device parameters.");
             }
         }
@@ -1419,9 +2116,11 @@ namespace FlukeEventView
 
                 _serialPort.DiscardInBuffer();
                 byte[] cmdA = new byte[] { 0x00, 0xFF, 0xFF, 0x41, 0xBE };
+
+                PulseTxIndicator();
                 _serialPort.Write(cmdA, 0, cmdA.Length);
 
-                byte[] raw = ReadBytesWithTimeout(_serialPort, 94, 650);
+                byte[] raw = ReadBytesWithTimeout(_serialPort, 94, 650, cmdA.Length);
                 if (raw.Length < 88) return null;
 
                 int startIdx = -1;
@@ -1452,6 +2151,7 @@ namespace FlukeEventView
                     }
                 }
 
+                _lastValidDeviceTick = Environment.TickCount;
                 return hdr88;
             }
         }
@@ -1468,12 +2168,12 @@ namespace FlukeEventView
                 {
                     var liveSite = SiteData.ParseFromDeviceHeader(hdr, DateTime.Now);
 
-                    // Если это первый ответ от прибора или сменился серийный номер подключенного устройства —
-                    // загружаем все его аппаратные параметры и уставки в интерфейс
                     if (!_initialSetupLoadedFromDevice || _currentSite.SerialNumber != liveSite.SerialNumber)
                     {
+                        _hasSessionMinMax = false;
                         _currentSite = liveSite;
                         PopulateSetupInputsFromSite(_currentSite);
+                        SyncFilterDatePickersFromSite(_currentSite);
                         _initialSetupLoadedFromDevice = true;
                         this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
                         LogMessage($"Detected Recorder SN#F{_currentSite.SerialNumber} (FW v{_currentSite.FirmwareVersion}). Loaded device parameters and setup.");
@@ -1498,6 +2198,8 @@ namespace FlukeEventView
                         _currentSite.OpenEvents = liveSite.OpenEvents;
                         _currentSite.RawHeader88 = liveSite.RawHeader88;
                     }
+
+                    UpdateSessionMinMax(liveSite.LiveHnVolt, liveSite.LiveNgVolt, liveSite.LiveFreq);
 
                     UpdateRealtimeAndInfoPanels(_currentSite);
                     _lblStatus.Text = T(
@@ -1525,7 +2227,9 @@ namespace FlukeEventView
                     _currentSite = SiteData.ParseFromDeviceHeader(hdr, DateTime.Now);
                     _initialSetupLoadedFromDevice = true;
                     this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
+                    UpdateSessionMinMax(_currentSite.LiveHnVolt, _currentSite.LiveNgVolt, _currentSite.LiveFreq);
                     PopulateSetupInputsFromSite(_currentSite);
+                    SyncFilterDatePickersFromSite(_currentSite);
                     UpdateRealtimeAndInfoPanels(_currentSite);
                     LogMessage($"Reloaded setup thresholds from Recorder SN#F{_currentSite.SerialNumber}.");
                     _lblStatus.Text = T(
@@ -1568,6 +2272,7 @@ namespace FlukeEventView
                 var site = SiteData.ParseFromDeviceHeader(header, DateTime.Now);
                 _initialSetupLoadedFromDevice = true;
                 this.Text = $"Fluke EventView EV101 - [SN F{site.SerialNumber}]";
+                UpdateSessionMinMax(site.LiveHnVolt, site.LiveNgVolt, site.LiveFreq);
 
                 if (site.StoredEventCount == 0)
                 {
@@ -1575,9 +2280,9 @@ namespace FlukeEventView
                     _selectedTransientEvent = null;
                     _eventsDownloadedForCurrentSession = true;
                     PopulateSetupInputsFromSite(_currentSite);
+                    SyncFilterDatePickersFromSite(_currentSite);
                     UpdateRealtimeAndInfoPanels(_currentSite);
-                    _gridEvents.Rows.Clear();
-                    _pnlCharts.Invalidate();
+                    PopulateEventsGrid(_currentSite);
                     _lblStatus.Text = T($"В памяти прибора SN#F{site.SerialNumber} нет записанных событий (0).", $"No Events Stored in recorder SN#F{site.SerialNumber}.");
                     LogMessage($"Recorder SN#F{site.SerialNumber} has 0 stored events. Events table cleared.");
                     return;
@@ -1621,6 +2326,7 @@ namespace FlukeEventView
                     Invoke(new Action(() =>
                     {
                         PopulateSetupInputsFromSite(_currentSite);
+                        SyncFilterDatePickersFromSite(_currentSite);
                         UpdateRealtimeAndInfoPanels(_currentSite);
                         PopulateEventsGrid(_currentSite);
                         _lblStatus.Text = T($"Загрузка событий из SN#F{_currentSite.SerialNumber} завершена.", "Downloading complete.");
@@ -1650,9 +2356,10 @@ namespace FlukeEventView
                 byte[] req = new byte[] { 0x00, 0xFF, 0xFF, cmd, blockIndex, crc };
 
                 LogMessage($"Command Get Events (Block {blockIndex}): {BitConverter.ToString(req)}");
+                PulseTxIndicator();
                 _serialPort.Write(req, 0, req.Length);
 
-                byte[] rx = ReadBytesWithTimeout(_serialPort, 263, 2200);
+                byte[] rx = ReadBytesWithTimeout(_serialPort, 263, 2200, req.Length);
                 LogMessage($"Block {blockIndex} response: {rx.Length} bytes.");
 
                 int startIdx = 0;
@@ -1668,7 +2375,11 @@ namespace FlukeEventView
                 int avail = Math.Max(0, rx.Length - startIdx);
                 int copyLen = Math.Min(256, avail);
                 byte[] data256 = new byte[copyLen];
-                if (copyLen > 0) Array.Copy(rx, startIdx, data256, 0, copyLen);
+                if (copyLen > 0)
+                {
+                    Array.Copy(rx, startIdx, data256, 0, copyLen);
+                    _lastValidDeviceTick = Environment.TickCount;
+                }
                 return data256;
             }
         }
@@ -1770,13 +2481,15 @@ namespace FlukeEventView
                         {
                             _serialPort.DiscardInBuffer();
                             LogMessage($"Sending Setup (Try {tryNum}): {BitConverter.ToString(rawBytes)}");
+                            PulseTxIndicator();
                             _serialPort.Write(rawBytes, 0, rawBytes.Length);
                             Thread.Sleep(550);
 
-                            byte[] rx = ReadBytesWithTimeout(_serialPort, 64, 450);
+                            byte[] rx = ReadBytesWithTimeout(_serialPort, 64, 450, rawBytes.Length);
                             LogMessage($"Setup Response: {BitConverter.ToString(rx)}");
-                            if (rx.Length > 0)
+                            if (rx.Length > rawBytes.Length)
                             {
+                                _lastValidDeviceTick = Environment.TickCount;
                                 success = true;
                                 break;
                             }
@@ -1784,22 +2497,24 @@ namespace FlukeEventView
                     }
                 });
 
+                _hasSessionMinMax = false;
                 byte[] verifyHdr = await Task.Run(() => RequestDeviceHeader88());
                 if (verifyHdr != null && verifyHdr.Length == 88)
                 {
                     _currentSite = SiteData.ParseFromDeviceHeader(verifyHdr, DateTime.Now);
                     _initialSetupLoadedFromDevice = true;
                     this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
+                    UpdateSessionMinMax(_currentSite.LiveHnVolt, _currentSite.LiveNgVolt, _currentSite.LiveFreq);
                     PopulateSetupInputsFromSite(_currentSite);
+                    SyncFilterDatePickersFromSite(_currentSite);
                     UpdateRealtimeAndInfoPanels(_currentSite);
                 }
 
                 _currentSite.Events.Clear();
                 _currentSite.OpenEvents.Clear();
                 _selectedTransientEvent = null;
-                _gridEvents.Rows.Clear();
                 _eventsDownloadedForCurrentSession = false;
-                _pnlCharts.Invalidate();
+                PopulateEventsGrid(_currentSite);
 
                 if (success)
                 {
@@ -1820,7 +2535,7 @@ namespace FlukeEventView
             }
         }
 
-        private static byte[] ReadBytesWithTimeout(SerialPort port, int targetCount, int timeoutMs)
+        private byte[] ReadBytesWithTimeout(SerialPort port, int targetCount, int timeoutMs, int echoLength = 5)
         {
             List<byte> result = new List<byte>(targetCount);
             int start = Environment.TickCount;
@@ -1833,6 +2548,11 @@ namespace FlukeEventView
                     byte[] buf = new byte[toRead];
                     int read = port.Read(buf, 0, toRead);
                     for (int i = 0; i < read; i++) result.Add(buf[i]);
+
+                    if (result.Count > echoLength)
+                    {
+                        PulseRxIndicator();
+                    }
                 }
                 else
                 {
@@ -1843,7 +2563,7 @@ namespace FlukeEventView
         }
 
         // =========================================================================
-        // РАЗДЕЛЬНОЕ ОБНОВЛЕНИЕ: 1) УСТАВКИ, 2) REALTIME & INFO, 3) ТАБЛИЦА EVENTS
+        // РАЗДЕЛЬНОЕ ОБНОВЛЕНИЕ: 1) УСТАВКИ, 2) REALTIME & INFO, 3) ТАБЛИЦА EVENTS С ФИЛЬТРОМ
         // =========================================================================
         private void PopulateSetupInputsFromSite(SiteData s)
         {
@@ -1875,18 +2595,54 @@ namespace FlukeEventView
             SetSafeNum(_numMinFreq, (decimal)s.MinFreq);
         }
 
-        /// <summary>
-        /// Если сессии с устройством еще не было (s.HasValidData == false), выводит прочерки "---"
-        /// во всех полях прибора. Как только устройство ответило — выводит реальные считанные данные.
-        /// </summary>
         private void UpdateRealtimeAndInfoPanels(SiteData s)
         {
-            if (s == null || !s.HasValidData)
+            if (_isScanning && s != null && s.HasValidData)
+            {
+                _lblRealLineVolt.Text = $"{s.LiveHnVolt:0} V";
+                _lblRealGndVolt.Text = $"{s.LiveNgVolt:0.0} V";
+                _lblRealFreq.Text = $"{s.LiveFreq:00.0} Hz";
+
+                if (_hasSessionMinMax)
+                {
+                    _lblMinLineVolt.Text = $"{_sessionMinHnVolt:0} V";
+                    _lblMaxLineVolt.Text = $"{_sessionMaxHnVolt:0} V";
+
+                    _lblMinGndVolt.Text = $"{_sessionMinNgVolt:0.0} V";
+                    _lblMaxGndVolt.Text = $"{_sessionMaxNgVolt:0.0} V";
+
+                    _lblMinFreqVal.Text = $"{_sessionMinFreq:00.0} Hz";
+                    _lblMaxFreqVal.Text = $"{_sessionMaxFreq:00.0} Hz";
+                }
+            }
+            else
             {
                 _lblRealLineVolt.Text = "---";
                 _lblRealGndVolt.Text = "---";
                 _lblRealFreq.Text = "---";
 
+                _lblMinLineVolt.Text = "---";
+                _lblMaxLineVolt.Text = "---";
+                _lblMinGndVolt.Text = "---";
+                _lblMaxGndVolt.Text = "---";
+                _lblMinFreqVal.Text = "---";
+                _lblMaxFreqVal.Text = "---";
+            }
+
+            _lblRealLineVolt.ForeColor = Color.DarkGreen;
+            _lblRealGndVolt.ForeColor = Color.DarkGreen;
+            _lblRealFreq.ForeColor = Color.DarkGreen;
+
+            _lblMinLineVolt.ForeColor = Color.DarkSlateBlue;
+            _lblMinGndVolt.ForeColor = Color.DarkSlateBlue;
+            _lblMinFreqVal.ForeColor = Color.DarkSlateBlue;
+
+            _lblMaxLineVolt.ForeColor = Color.DarkRed;
+            _lblMaxGndVolt.ForeColor = Color.DarkRed;
+            _lblMaxFreqVal.ForeColor = Color.DarkRed;
+
+            if (s == null || !s.HasValidData)
+            {
                 _lblInfoSerial.Text = T("Серийный номер прибора: ---", "Logger Serial Number: ---");
                 _lblInfoEventsCount.Text = T("Нет данных (прибор не подключен)", "No Device Data (Not Connected)");
                 _lblInfoFromDate.Text = T("      с     ---", "      from  ---");
@@ -1894,19 +2650,6 @@ namespace FlukeEventView
                 _lblInfoFirmware.Text = T("Версия прошивки VR101: ---", "VR101 Firmware Version: ---");
                 _lblInfoMode.Text = T("Режим прибора: ---", "Device Mode: ---");
                 return;
-            }
-
-            if (_isScanning)
-            {
-                _lblRealLineVolt.Text = $"{s.LiveHnVolt:0} Vrms";
-                _lblRealGndVolt.Text = $"{s.LiveNgVolt:0.0} Vrms";
-                _lblRealFreq.Text = $"{s.LiveFreq:00.0} Hz";
-            }
-            else
-            {
-                _lblRealLineVolt.Text = "---";
-                _lblRealGndVolt.Text = "---";
-                _lblRealFreq.Text = "---";
             }
 
             _lblInfoSerial.Text = T($"Серийный номер прибора: F{s.SerialNumber}", $"Logger Serial Number: F{s.SerialNumber}");
@@ -1933,12 +2676,19 @@ namespace FlukeEventView
 
             if (s == null || !s.HasValidData || (s.StoredEventCount == 0 && s.Events.Count == 0))
             {
-                _pnlCharts.Invalidate();
+                if (_lblFilterCount != null)
+                    _lblFilterCount.Text = T("Показано: 0 из 0", "Showing: 0 of 0");
+                _pnlCharts?.Invalidate();
                 return;
             }
 
+            int totalRecords = s.OpenEvents.Count + s.Events.Count;
+            int shownRecords = 0;
+
             foreach (var openEv in s.OpenEvents)
             {
+                if (!MatchesEventFilter(openEv)) continue;
+
                 int rIdx = _gridEvents.Rows.Add(
                     0,
                     openEv.Timestamp.ToString("dd.MM.yyyy HH:mm:ss"),
@@ -1951,11 +2701,14 @@ namespace FlukeEventView
                 _gridEvents.Rows[rIdx].Height = _gridEvents.RowTemplate.Height;
                 _gridEvents.Rows[rIdx].DefaultCellStyle.BackColor = Color.FromArgb(215, 235, 255);
                 _gridEvents.Rows[rIdx].DefaultCellStyle.Font = new Font(_gridEvents.Font, FontStyle.Bold);
+                shownRecords++;
             }
 
             for (int i = s.Events.Count - 1; i >= 0; i--)
             {
                 var ev = s.Events[i];
+                if (!MatchesEventFilter(ev)) continue;
+
                 int rIdx = _gridEvents.Rows.Add(
                     ev.Index,
                     ev.Timestamp.ToString("dd.MM.yyyy HH:mm:ss"),
@@ -1970,13 +2723,21 @@ namespace FlukeEventView
                 {
                     _gridEvents.Rows[rIdx].DefaultCellStyle.BackColor = Color.FromArgb(255, 250, 240);
                 }
+                shownRecords++;
             }
 
-            _pnlCharts.Invalidate();
+            if (_lblFilterCount != null)
+            {
+                _lblFilterCount.Text = T(
+                    $"Показано записей: {shownRecords} из {totalRecords}",
+                    $"Showing: {shownRecords} of {totalRecords}");
+            }
+
+            _pnlCharts?.Invalidate();
         }
 
         // =========================================================================
-        // ОТРИСОВКА 3 ШТАТНЫХ РЕЖИМОВ ГРАФИКОВ
+        // ОТРИСОВКА 3 ШТАТНЫХ РЕЖИМОВ ГРАФИКОВ (С УЧЕТОМ ФИЛЬТРАЦИИ)
         // =========================================================================
         private void DrawChartsGraphics(object sender, PaintEventArgs e)
         {
@@ -2016,6 +2777,18 @@ namespace FlukeEventView
 
         private void DrawQuickSummaryBarChart(Graphics g, Rectangle rect)
         {
+            var listToPlot = GetEventsForChartsAndExport();
+            if (listToPlot.Count == 0)
+            {
+                using (var fnt = new Font("MS Sans Serif", 10f * _fontScale))
+                {
+                    g.DrawString(
+                        T("Нет событий, соответствующих выбранному фильтру.", "No events match the selected filter."),
+                        fnt, Brushes.Gray, new Point(20, 20));
+                }
+                return;
+            }
+
             using (var titleFont = new Font("MS Sans Serif", 11f * _fontScale, FontStyle.Bold))
             using (var labelFont = new Font("Arial", 8.5f * _fontScale))
             using (var valFont = new Font("Arial", 9.5f * _fontScale, FontStyle.Bold))
@@ -2025,7 +2798,7 @@ namespace FlukeEventView
                       $"Quick Summary (Bar Graph) — SN F{_currentSite.SerialNumber}"),
                     titleFont, Brushes.Black, new Point(20, 15));
 
-                var groups = _currentSite.Events.GroupBy(ev => ev.GetLocalizedEventName(_lang)).ToList();
+                var groups = listToPlot.GroupBy(ev => ev.GetLocalizedEventName(_lang)).ToList();
                 int startX = 70, startY = rect.Height - 65, colWidth = (int)(120 * _fontScale);
                 int maxCount = Math.Max(1, groups.Max(gr => gr.Count()));
 
@@ -2050,6 +2823,18 @@ namespace FlukeEventView
 
         private void DrawEventDistributionTimeline(Graphics g, Rectangle rect)
         {
+            var listToPlot = GetEventsForChartsAndExport();
+            if (listToPlot.Count == 0)
+            {
+                using (var fnt = new Font("MS Sans Serif", 10f * _fontScale))
+                {
+                    g.DrawString(
+                        T("Нет событий, соответствующих выбранному фильтру.", "No events match the selected filter."),
+                        fnt, Brushes.Gray, new Point(20, 20));
+                }
+                return;
+            }
+
             using (var titleFont = new Font("MS Sans Serif", 11f * _fontScale, FontStyle.Bold))
             {
                 g.DrawString(
@@ -2061,11 +2846,11 @@ namespace FlukeEventView
                 g.DrawLine(Pens.Black, ox, oy, ox + w, oy);
                 g.DrawLine(Pens.Black, ox, oy - h, ox, oy);
 
-                DateTime minT = _currentSite.Events.Min(ev => ev.Timestamp);
-                DateTime maxT = _currentSite.Events.Max(ev => ev.Timestamp);
+                DateTime minT = listToPlot.Min(ev => ev.Timestamp);
+                DateTime maxT = listToPlot.Max(ev => ev.Timestamp);
                 double totalSec = Math.Max(1.0, (maxT - minT).TotalSeconds);
 
-                foreach (var ev in _currentSite.Events)
+                foreach (var ev in listToPlot)
                 {
                     double sec = (ev.Timestamp - minT).TotalSeconds;
                     int px = ox + (int)((sec / totalSec) * w);
@@ -2238,6 +3023,9 @@ namespace FlukeEventView
             }
         }
 
+        // =========================================================================
+        // ОТКРЫТИЕ И СОХРАНЕНИЕ ФАЙЛОВ СЕССИИ (.VER) И ЭКСПОРТ (.CSV)
+        // =========================================================================
         private void OnOpenVerFile(object sender, EventArgs e)
         {
             using (var ofd = new OpenFileDialog { Filter = "Site Files (*.ver)|*.ver|All Files (*.*)|*.*" })
@@ -2250,6 +3038,7 @@ namespace FlukeEventView
                         _selectedTransientEvent = _currentSite.Events.LastOrDefault(x => x.IsSingleTransient);
                         this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber} - {Path.GetFileName(ofd.FileName)}]";
                         PopulateSetupInputsFromSite(_currentSite);
+                        SyncFilterDatePickersFromSite(_currentSite);
                         UpdateRealtimeAndInfoPanels(_currentSite);
                         PopulateEventsGrid(_currentSite);
                         LogMessage($"Loaded file \"{ofd.FileName}\" ({_currentSite.Events.Count} events).");
@@ -2299,15 +3088,23 @@ namespace FlukeEventView
             {
                 if (sfd.ShowDialog() == DialogResult.OK)
                 {
+                    bool applyFilter = _chkFilterChartsAndCsv != null && _chkFilterChartsAndCsv.Checked && IsAnyFilterActive();
                     var sb = new StringBuilder();
                     sb.AppendLine("Event,Start Time,Event,Extreme,End,RawHex");
+
                     foreach (var openEv in _currentSite.OpenEvents)
+                    {
+                        if (applyFilter && !MatchesEventFilter(openEv)) continue;
                         sb.AppendLine($"0,\"{openEv.Timestamp:dd.MM.yyyy HH:mm:ss}\",\"{openEv.GetLocalizedEventName(_lang)}\",\"{openEv.ExtremeText}\",\"{openEv.GetLocalizedEndText(_lang)}\",\"{BitConverter.ToString(openEv.Raw)}\"");
+                    }
+
                     for (int i = _currentSite.Events.Count - 1; i >= 0; i--)
                     {
                         var ev = _currentSite.Events[i];
+                        if (applyFilter && !MatchesEventFilter(ev)) continue;
                         sb.AppendLine($"{ev.Index},\"{ev.Timestamp:dd.MM.yyyy HH:mm:ss}\",\"{ev.GetLocalizedEventName(_lang)}\",\"{ev.ExtremeText}\",\"{ev.GetLocalizedEndText(_lang)}\",\"{BitConverter.ToString(ev.Raw)}\"");
                     }
+
                     File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
                     MessageBox.Show(T("Файл успешно сохранен!", "File Saved!"), "Fluke EventView", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
@@ -2316,13 +3113,14 @@ namespace FlukeEventView
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            _ledBlinkTimer?.Stop();
             StopScanningPort();
             base.OnFormClosing(e);
         }
     }
 
     // =========================================================================
-    // КЛАСС ДАННЫХ ПРИБОРА И ТОЧНЫЙ ПАРСЕР ФОРМАТА .VER (VB3 152B Header + 16B Events)
+    // КЛАСС ДАННЫХ ПРИБОРА И ПАРСЕР ФОРМАТА .VER (VB3 152B Header + 16B Events)
     // =========================================================================
     public class SiteData
     {
@@ -2454,9 +3252,6 @@ namespace FlukeEventView
             }
         }
 
-        /// <summary>
-        /// Чтение оригинального файла .VER (152-байтный заголовок VB3 + события по 16 байт [8 x UInt16])
-        /// </summary>
         public static SiteData LoadFromVerFile(string path)
         {
             byte[] data = File.ReadAllBytes(path);
@@ -2466,15 +3261,12 @@ namespace FlukeEventView
             var s = new SiteData { HasValidData = true };
             Array.Copy(data, 2, s.RawHeader150, 0, 150);
 
-            // 1. Время окончания (смещение 2..9) и время старта (смещение 10..17) в формате OLE Automation Date
             s.EndTime = DateTime.FromOADate(BitConverter.ToDouble(data, 2));
             s.StartTime = DateTime.FromOADate(BitConverter.ToDouble(data, 10));
 
-            // 2. Тики работы прибора (смещение 18..21) и Серийный номер (смещение 22..25)
             s.ElapsedTicks = BitConverter.ToUInt32(data, 18);
             s.SerialNumber = BitConverter.ToInt32(data, 22);
 
-            // 3. Байт аппаратной модификации и прошивки (смещение 92..93, например 0x0089 -> 220V, FW v9)
             byte b51 = data[92];
             if (b51 == 0) b51 = 0x89;
             s.Is220V = (b51 & 0x80) != 0;
@@ -2482,19 +3274,16 @@ namespace FlukeEventView
             s.NgScale025 = (b51 & 0x10) != 0;
             double vMult = s.Is220V ? 2.0 : 1.0;
 
-            // 4. Живые показания на момент сохранения файла
             s.LiveHnVolt = BitConverter.ToUInt16(data, 26) * vMult;
             s.LiveNgVolt = s.NgScale025 ? (data[29] * 0.25) : data[29];
             double savedFreq = BitConverter.ToDouble(data, 102);
             s.LiveFreq = (savedFreq > 40.0 && savedFreq < 70.0) ? Math.Round(savedFreq, 1) : 50.0;
 
-            // 5. Опции (смещение 32..33)
             s.OptionsByte = data[32];
             s.Is50Hz = (s.OptionsByte & 0x04) != 0;
             s.FlashLed = (s.OptionsByte & 0x02) == 0;
             s.IsFifo = (s.OptionsByte & 0x01) != 0;
 
-            // 6. Пороги частоты (по смещению 34 лежит MaxFreqWord, по смещению 38 — MinFreqWord)
             int wordA = BitConverter.ToInt32(data, 34);
             int wordB = BitConverter.ToInt32(data, 38);
             if (wordA > 100 && wordB > 100)
@@ -2505,7 +3294,6 @@ namespace FlukeEventView
                 s.MaxFreq = Math.Max(fA, fB);
             }
 
-            // 7. Пороги напряжений (смещения 42, 44, 46, 48, 50 — по 2 байта Int16)
             s.HnSag = (int)Math.Round(BitConverter.ToUInt16(data, 42) * vMult);
             s.HnSwell = (int)Math.Round(BitConverter.ToUInt16(data, 44) * vMult);
             s.HnImpulse = BitConverter.ToUInt16(data, 46) * 10;
@@ -2513,16 +3301,13 @@ namespace FlukeEventView
             s.NgSurge = s.NgScale025 ? Math.Round(rawNgSwell * 0.25, 1) : rawNgSwell;
             s.NgImpulse = BitConverter.ToUInt16(data, 50) * 10;
 
-            // 8. Описание сайта (смещение 52..81, 30 символов ASCII)
             s.Description = Encoding.ASCII.GetString(data, 52, 30).Trim('\0', ' ');
 
-            // 9. Реальное число записанных событий хранится в байтах по смещению 110 (ptrBytes / 8) и 114 (totBytes / 8)
             int ptrBytes = BitConverter.ToInt32(data, 110);
             int totBytes = BitConverter.ToInt32(data, 114);
             int headerEventCount = Math.Max(ptrBytes, totBytes) / 8;
             int remainingBytes = data.Length - 152;
 
-            // 10. Три 8-байтовых слота активных событий "Open Event" (смещения 126..149)
             for (int slot = 0; slot < 3; slot++)
             {
                 byte[] slotBytes = new byte[8];
@@ -2534,8 +3319,6 @@ namespace FlukeEventView
                 }
             }
 
-            // 11. Чтение массива событий (со смещения 152):
-            // В оригинальном .VER каждое событие занимает 16 байт (8 слов UInt16 Little-Endian)
             if (remainingBytes >= 16 && remainingBytes % 16 == 0)
             {
                 int evCount = remainingBytes / 16;
@@ -2555,7 +3338,6 @@ namespace FlukeEventView
             }
             else if (remainingBytes >= 8)
             {
-                // Резервная поддержка для упакованных 8-байтных файлов
                 s.StoredEventCount = remainingBytes / 8;
                 byte[] evBuf = new byte[remainingBytes];
                 Array.Copy(data, 152, evBuf, 0, remainingBytes);
@@ -2565,9 +3347,6 @@ namespace FlukeEventView
             return s;
         }
 
-        /// <summary>
-        /// Сохранение в 100% совместимый с оригиналом формат .VER (152 байта заголовка + 16 байт на каждое событие)
-        /// </summary>
         public void SaveToVerFile(string path)
         {
             using (var fs = new FileStream(path, FileMode.Create))
@@ -2604,7 +3383,6 @@ namespace FlukeEventView
                 BitConverter.GetBytes((short)b51).CopyTo(hdr, 90);
                 BitConverter.GetBytes(LiveFreq).CopyTo(hdr, 100);
 
-                // Смещения 110 и 114 в файле (108 и 112 в массиве hdr): размер буфера событий в байтах (Count * 8)
                 BitConverter.GetBytes(Events.Count * 8).CopyTo(hdr, 108);
                 BitConverter.GetBytes(Events.Count * 8).CopyTo(hdr, 112);
 
@@ -2613,7 +3391,6 @@ namespace FlukeEventView
                     Array.Copy(OpenEvents[slot].Raw, 0, hdr, 124 + slot * 8, 8);
                 }
 
-                // Смещение 150 в файле (148 в массиве hdr): флаг наличия выгруженных событий (1 или 0)
                 BitConverter.GetBytes((ushort)(Events.Count > 0 ? 1 : 0)).CopyTo(hdr, 148);
                 bw.Write(hdr);
 
@@ -2628,11 +3405,15 @@ namespace FlukeEventView
         }
     }
 
+    // =========================================================================
+    // КЛАСС ДЕКОДИРОВАНИЯ 8-БАЙТНОЙ ЗАПИСИ СОБЫТИЯ (EventRecord)
+    // =========================================================================
     public class EventRecord
     {
         public int Index { get; set; }
         public byte[] Raw { get; set; } = new byte[8];
         public DateTime Timestamp { get; set; }
+        public EventCategory Category { get; set; } = EventCategory.All;
         public string EventNameEn { get; set; } = "";
         public string EventNameRu { get; set; } = "";
         public string ExtremeText { get; set; } = "";
@@ -2663,7 +3444,6 @@ namespace FlukeEventView
             double ticksPerDeg = is50 ? 3.2 : (960.0 / 360.0);
 
             uint rawDur = (uint)((b[2] << 16) | (b[3] << 8) | b[4]);
-            // Коды 0x06, 0x86, 0x08, 0x88 хранят длительность в 8-секундных тиках, а 0x05, 0x85, 0x07, 0x87 — в полупериодах!
             bool durIn8SecTicks = (type == 0x06 || type == 0x86 || type == 0x08 || type == 0x88);
 
             string durEn = isOpenEvent ? "Open Event" : (durIn8SecTicks ? FormatTickDuration(rawDur, AppLang.En) : FormatHalfCycles(rawDur, baseFreq, AppLang.En));
@@ -2678,6 +3458,7 @@ namespace FlukeEventView
                     int phaseTicks = (b[3] << 8) | b[4];
                     int deg = (int)Math.Floor((phaseTicks / ticksPerDeg) + 0.625);
 
+                    r.Category = EventCategory.HnTransient;
                     r.IsTransient = true;
                     r.IsNgTransient = false;
                     r.TransientCount = count;
@@ -2698,6 +3479,7 @@ namespace FlukeEventView
                     int ngTicks = (b[3] << 8) | b[4];
                     int ngDeg = (int)Math.Floor((ngTicks / ticksPerDeg) + 0.625);
 
+                    r.Category = EventCategory.NgTransient;
                     r.IsTransient = true;
                     r.IsNgTransient = true;
                     r.TransientCount = ngCount;
@@ -2711,9 +3493,10 @@ namespace FlukeEventView
                     r.EndTextRu = $"{ngDeg}°";
                     break;
 
-                case 0x85: // H-N Swell (длительность в полупериодах)
-                case 0x86: // H-N Swell (длительность в 8-сек тиках)
+                case 0x85:
+                case 0x86:
                 case 0x16:
+                    r.Category = EventCategory.HnSwell;
                     r.EventNameEn = "H-N Swell";
                     r.EventNameRu = "Перенапряжение H-N";
                     r.ExtremeText = $"{(b[1] * vMult):0}   Vrms";
@@ -2721,17 +3504,19 @@ namespace FlukeEventView
                     r.EndTextRu = durRu;
                     break;
 
-                case 0x05: // H-N Sag (длительность в полупериодах)
-                case 0x06: // H-N Sag (длительность в 8-сек тиках)
+                case 0x05:
+                case 0x06:
                 case 0x17:
                     if (b[1] == 0)
                     {
+                        r.Category = EventCategory.Outage;
                         r.EventNameEn = "Outage";
                         r.EventNameRu = "Обрыв питания";
                         r.ExtremeText = "0 Vrms";
                     }
                     else
                     {
+                        r.Category = EventCategory.HnSag;
                         r.EventNameEn = "H-N Sag";
                         r.EventNameRu = "Провал H-N";
                         r.ExtremeText = $"{(b[1] * vMult):0}   Vrms";
@@ -2740,8 +3525,9 @@ namespace FlukeEventView
                     r.EndTextRu = durRu;
                     break;
 
-                case 0x07: // Low Frequency (в полупериодах)
-                case 0x08: // Low Frequency (в 8-сек тиках)
+                case 0x07:
+                case 0x08:
+                    r.Category = EventCategory.LowFreq;
                     r.EventNameEn = "Low Frequency";
                     r.EventNameRu = "Низкая частота";
                     double lowF = baseFreq - ((b[1] - 1) * 0.1);
@@ -2750,8 +3536,9 @@ namespace FlukeEventView
                     r.EndTextRu = durRu;
                     break;
 
-                case 0x87: // High Frequency (в полупериодах)
-                case 0x88: // High Frequency (в 8-сек тиках)
+                case 0x87:
+                case 0x88:
+                    r.Category = EventCategory.HighFreq;
                     r.EventNameEn = "High Frequency";
                     r.EventNameRu = "Высокая частота";
                     double highF = baseFreq + (b[1] * 0.1);
@@ -2764,6 +3551,7 @@ namespace FlukeEventView
                 case 0x14:
                 case 0x09:
                 case 0x89:
+                    r.Category = EventCategory.NgSwell;
                     r.EventNameEn = "N-G Swell";
                     r.EventNameRu = "Превышение N-G";
                     double ngV = ngScale025 ? (b[1] * 0.25) : b[1];
@@ -2773,6 +3561,7 @@ namespace FlukeEventView
                     break;
 
                 case 0x80:
+                    r.Category = EventCategory.Outage;
                     r.EventNameEn = "Outage";
                     r.EventNameRu = "Обрыв питания";
                     r.ExtremeText = "0 Vrms";
@@ -2781,6 +3570,7 @@ namespace FlukeEventView
                     break;
 
                 default:
+                    r.Category = EventCategory.All;
                     r.EventNameEn = $"Event 0x{type:X2}";
                     r.EventNameRu = $"Событие 0x{type:X2}";
                     r.ExtremeText = $"{(b[1] * vMult):0} V";

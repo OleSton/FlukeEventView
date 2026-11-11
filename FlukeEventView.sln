@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.31321.278
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FlukeEventView", "FlukeEventView.csproj", "{2BA7AC5B-00F1-4105-B18C-A8C66ECA847B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2BA7AC5B-00F1-4105-B18C-A8C66ECA847B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2BA7AC5B-00F1-4105-B18C-A8C66ECA847B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2BA7AC5B-00F1-4105-B18C-A8C66ECA847B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2BA7AC5B-00F1-4105-B18C-A8C66ECA847B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {AC797710-AD80-4F1B-8404-30C480261F2D}
+	EndGlobalSection
+EndGlobal

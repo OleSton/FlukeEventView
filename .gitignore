@@ -1,0 +1,17 @@
+﻿# Visual Studio / .NET
+.vs/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.dbmdl
+*.publishproj
+*.Publish.xml
+__pycache__/
+*.exe
+*.pdb
+*.cache
+*.log

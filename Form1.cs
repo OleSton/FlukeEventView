@@ -1,9 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Drawing.Printing;
 using System.Globalization;
 using System.IO;
 using System.IO.Ports;
@@ -15,35 +16,6 @@ using System.Windows.Forms;
 
 namespace FlukeEventView
 {
-    /// <summary>
-    /// Перечисление доступных языков интерфейса программы (Русский / Английский).
-    /// </summary>
-    public enum AppLang
-    {
-        Ru = 0,
-        En = 1
-    }
-
-    /// <summary>
-    /// Категории событий для фильтрации журнала по типам помех.
-    /// </summary>
-    public enum EventCategory
-    {
-        All = 0,          // Все события
-        HnSwell = 1,      // Перенапряжение Фаза-Нейтраль (H-N Swell)
-        HnSag = 2,        // Провал Фаза-Нейтраль (H-N Sag)
-        HnTransient = 3,  // Высоковольтный импульс Фаза-Нейтраль (H-N Transient)
-        NgSwell = 4,      // Превышение Нейтраль-Земля (N-G Swell)
-        NgTransient = 5,  // Высоковольтный импульс Нейтраль-Земля (N-G Transient)
-        HighFreq = 6,     // Высокая частота сети (High Frequency)
-        LowFreq = 7,      // Низкая частота сети (Low Frequency)
-        Outage = 8,       // Обрыв питания (Outage)
-        OpenOnly = 9      // Только активные незавершенные события (Open Event)
-    }
-
-    /// <summary>
-    /// Главная форма приложения Fluke EventView EV101.
-    /// </summary>
     public partial class Form1 : Form
     {
         private AppLang _lang = AppLang.Ru;
@@ -213,6 +185,7 @@ namespace FlukeEventView
             InitTimers();
             RefreshComPorts();
             ApplyLocalization();
+            ApplyParityLocalization();
             LogMessage(T("Fluke EventView V2.16 инициализирован.", "Fluke EventView V2.16 initialized."));
             LogMessage(T("Выберите COM-порт и нажмите 'Старт опроса' для подключения к VR101.", "Select COM port and click 'Start Scanning' to connect to VR101."));
         }
@@ -261,6 +234,60 @@ namespace FlukeEventView
         // =========================================================================
         // УЧЕТ И СБРОС МИНИМАЛЬНЫХ / МАКСИМАЛЬНЫХ ЗНАЧЕНИЙ ЗА СЕССИЮ ПОДКЛЮЧЕНИЯ
         // =========================================================================
+        /// <summary>
+        /// Оригинальный EventView выводит сообщение «Loss of Synchronization», когда теряет
+        /// синхронизацию с регистратором. Отдельного кода события для этого сообщения не
+        /// установлено, поэтому признаком служит откат счётчика наработки прибора назад:
+        /// это означает, что прибор был сброшен либо терял питание/синхронизацию.
+        /// </summary>
+        private void CheckSynchronizationLoss(SiteData live)
+        {
+            if (live == null || !live.HasValidData) return;
+
+            bool lost = _prevElapsedTicks > 0 && live.ElapsedTicks + 2 < _prevElapsedTicks;
+
+            if (lost && DateTime.Now < _suppressSyncLossUntil)
+            {
+                // Откат вызван нашей записью уставок — не считаем это потерей синхронизации
+                _prevElapsedTicks = live.ElapsedTicks;
+                return;
+            }
+
+            if (lost && (DateTime.Now - _lastSyncLossReport).TotalSeconds > 20)
+            {
+                _lastSyncLossReport = DateTime.Now;
+                LogMessage(T(
+                    $"{DateTime.Now:dd.MM.yyyy HH:mm:ss} — Loss of Synchronization (наработка прибора сброшена: {_prevElapsedTicks} -> {live.ElapsedTicks} тиков)",
+                    $"{DateTime.Now:dd.MM.yyyy HH:mm:ss} - Loss of Synchronization (recorder uptime reset: {_prevElapsedTicks} -> {live.ElapsedTicks} ticks)"));
+                _lblStatus.Text = T(
+                    "Потеря синхронизации с прибором: наработка сброшена (прибор перезапускался).",
+                    "Loss of Synchronization: recorder uptime was reset.");
+
+                // Добавляем запись в таблицу как событие, обнаруженное программой
+                var syn = new EventRecord
+                {
+                    Index = 0,
+                    Raw = new byte[8],
+                    IsSynthetic = true,
+                    IsOpenEvent = false,
+                    Category = EventCategory.LossOfSync,
+                    Timestamp = DateTime.Now,
+                    EventNameRu = "Потеря синхронизации",
+                    EventNameEn = "Loss of Synchronization",
+                    ExtremeText = "—",
+                    EndTextRu = $"наработка сброшена: {_prevElapsedTicks} → {live.ElapsedTicks} тиков",
+                    EndTextEn = $"uptime reset: {_prevElapsedTicks} -> {live.ElapsedTicks} ticks"
+                };
+
+                _syntheticEvents.Add(syn);
+                if (_syntheticEvents.Count > 200) _syntheticEvents.RemoveAt(0);
+
+                PopulateEventsGrid(_currentSite);
+            }
+
+            _prevElapsedTicks = live.ElapsedTicks;
+        }
+
         private void ResetSessionMinMax()
         {
             _hasSessionMinMax = false;
@@ -449,11 +476,14 @@ namespace FlukeEventView
         // =========================================================================
         private void BuildEventViewInterface()
         {
-            this.Text = "Fluke EventView EV101";
+            this.Text = "Fluke EventView VR101";
             this.Size = new Size(1460, 850);
             this.MinimumSize = new Size(1260, 740);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("MS Sans Serif", 8.25f);
+
+            // Иконка окна берётся из иконки самого exe-файла (app.ico задана в проекте)
+            try { this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             _toolTip = new ToolTip
             {
@@ -519,9 +549,9 @@ namespace FlukeEventView
             _mnuHelp = new ToolStripMenuItem();
             _mnuHelpAbout = new ToolStripMenuItem(null, null, (s, e) =>
                 MessageBox.Show(
-                    T("FLUKE EventView EV101 для Windows\nПрограмма мониторинга и настройки регистратора Fluke VR101 / VR101S.\nПротокол: 9600, N, 8, 1 (Lite-Link).",
-                      "FLUKE EventView EV101 for Windows\nFor use with the Fluke Voltage Event Recorder VR101 / VR101S.\nProtocol: 9600, N, 8, 1 (Lite-Link)."),
-                    T("О программе EventView EV101", "About EventView EV101"),
+                    T("FLUKE EventView VR101 для Windows\nПрограмма мониторинга и настройки регистратора Fluke VR101 / VR101S.\nПротокол: 9600, N, 8, 1 (Lite-Link).",
+                      "FLUKE EventView VR101 for Windows\nFor use with the Fluke Voltage Event Recorder VR101 / VR101S.\nProtocol: 9600, N, 8, 1 (Lite-Link)."),
+                    T("О программе EventView VR101", "About EventView VR101"),
                     MessageBoxButtons.OK, MessageBoxIcon.Information));
             _mnuHelp.DropDownItems.Add(_mnuHelpAbout);
 
@@ -661,6 +691,8 @@ namespace FlukeEventView
                     _pnlCharts.Invalidate();
                 }
             };
+
+            BuildParityExtras();
 
             this.Controls.Add(_mainTabs);
             this.Controls.Add(_toolBar);
@@ -963,7 +995,7 @@ namespace FlukeEventView
                 Margin = new Padding(0, 2, 12, 2),
                 Font = new Font("MS Sans Serif", 9f, FontStyle.Regular)
             };
-            for (int i = 0; i < 10; i++) _cmbEventFilter.Items.Add(i.ToString());
+            for (int i = 0; i < 11; i++) _cmbEventFilter.Items.Add(i.ToString());
             _cmbEventFilter.SelectedIndex = 0;
             _cmbEventFilter.SelectedIndexChanged += (s, e) =>
             {
@@ -1570,6 +1602,7 @@ namespace FlukeEventView
                 _cmbLang.SelectedIndex = (int)_lang;
 
             ApplyLocalization();
+            ApplyParityLocalization();
         }
 
         private void ApplyLocalization()
@@ -1578,8 +1611,8 @@ namespace FlukeEventView
             _mnuLangEn.Checked = (_lang == AppLang.En);
 
             this.Text = (_currentSite.HasValidData && _currentSite.SerialNumber > 0)
-                ? $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]"
-                : T("Fluke EventView EV101 - [Нет активного соединения с прибором]", "Fluke EventView EV101 - [No Active Device Session]");
+                ? $"Fluke EventView VR101 - [SN F{_currentSite.SerialNumber}]"
+                : T("Fluke EventView VR101 - [Нет активного соединения с прибором]", "Fluke EventView VR101 - [No Active Device Session]");
 
             _toolTip.ToolTipTitle = T("Аппаратные ограничения VR101", "VR101 Hardware Limits");
 
@@ -1615,7 +1648,7 @@ namespace FlukeEventView
 
             _mnuLang.Text = T("&Язык (Language)", "&Language");
             _mnuHelp.Text = T("&Справка", "&Help");
-            _mnuHelpAbout.Text = T("&О программе EventView EV101...", "&About EventView EV101...");
+            _mnuHelpAbout.Text = T("&О программе EventView VR101...", "&About EventView VR101...");
 
             // Панель инструментов
             _tsbOpen.Text = T("📂 Открыть .VER", "📂 Open .VER");
@@ -1703,6 +1736,7 @@ namespace FlukeEventView
                 _cmbEventFilter.Items[7] = T("Низкая частота (Low Frequency)", "Low Frequency");
                 _cmbEventFilter.Items[8] = T("Обрыв питания (Outage)", "Outage");
                 _cmbEventFilter.Items[9] = T("Только активные события (Open Events)", "Open Events Only");
+                _cmbEventFilter.Items[10] = T("Потеря синхронизации (Loss of Synchronization)", "Loss of Synchronization");
                 _cmbEventFilter.SelectedIndex = selFilter;
             }
             finally
@@ -1977,7 +2011,18 @@ namespace FlukeEventView
         private void LogMessage(string msg)
         {
             if (InvokeRequired) { Invoke(new Action<string>(LogMessage), msg); return; }
-            _txtCommLog.AppendText($"[{DateTime.Now:HH:mm:ss.fff}] {msg}{Environment.NewLine}");
+            string line = $"[{DateTime.Now:HH:mm:ss.fff}] {msg}";
+            _txtCommLog.AppendText(line + Environment.NewLine);
+
+            // Дублируем журнал в файл рядом с программой (как EV101MSG.LOG оригинала)
+            try
+            {
+                string path = Path.Combine(
+                    Path.GetDirectoryName(Application.ExecutablePath) ?? ".",
+                    "FlukeEventView.log");
+                File.AppendAllText(path, line + Environment.NewLine);
+            }
+            catch { /* файл недоступен — журнал остаётся только в окне */ }
         }
 
         private void ApplyDefaultSetupToInputs()
@@ -2175,8 +2220,9 @@ namespace FlukeEventView
                         PopulateSetupInputsFromSite(_currentSite);
                         SyncFilterDatePickersFromSite(_currentSite);
                         _initialSetupLoadedFromDevice = true;
-                        this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
+                        this.Text = $"Fluke EventView VR101 - [SN F{_currentSite.SerialNumber}]";
                         LogMessage($"Detected Recorder SN#F{_currentSite.SerialNumber} (FW v{_currentSite.FirmwareVersion}). Loaded device parameters and setup.");
+                        _prevElapsedTicks = liveSite.ElapsedTicks;
                     }
                     else
                     {
@@ -2198,6 +2244,9 @@ namespace FlukeEventView
                         _currentSite.OpenEvents = liveSite.OpenEvents;
                         _currentSite.RawHeader88 = liveSite.RawHeader88;
                     }
+
+                    CheckSynchronizationLoss(liveSite);
+                    LogRawHeaderDetails(hdr);
 
                     UpdateSessionMinMax(liveSite.LiveHnVolt, liveSite.LiveNgVolt, liveSite.LiveFreq);
 
@@ -2226,7 +2275,7 @@ namespace FlukeEventView
                 {
                     _currentSite = SiteData.ParseFromDeviceHeader(hdr, DateTime.Now);
                     _initialSetupLoadedFromDevice = true;
-                    this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
+                    this.Text = $"Fluke EventView VR101 - [SN F{_currentSite.SerialNumber}]";
                     UpdateSessionMinMax(_currentSite.LiveHnVolt, _currentSite.LiveNgVolt, _currentSite.LiveFreq);
                     PopulateSetupInputsFromSite(_currentSite);
                     SyncFilterDatePickersFromSite(_currentSite);
@@ -2271,7 +2320,7 @@ namespace FlukeEventView
 
                 var site = SiteData.ParseFromDeviceHeader(header, DateTime.Now);
                 _initialSetupLoadedFromDevice = true;
-                this.Text = $"Fluke EventView EV101 - [SN F{site.SerialNumber}]";
+                this.Text = $"Fluke EventView VR101 - [SN F{site.SerialNumber}]";
                 UpdateSessionMinMax(site.LiveHnVolt, site.LiveNgVolt, site.LiveFreq);
 
                 if (site.StoredEventCount == 0)
@@ -2322,6 +2371,7 @@ namespace FlukeEventView
                     _currentSite = site;
                     _selectedTransientEvent = _currentSite.Events.LastOrDefault(x => x.IsSingleTransient);
                     _eventsDownloadedForCurrentSession = true;
+                    _hasUnsavedSessionData = true;
 
                     Invoke(new Action(() =>
                     {
@@ -2329,6 +2379,7 @@ namespace FlukeEventView
                         SyncFilterDatePickersFromSite(_currentSite);
                         UpdateRealtimeAndInfoPanels(_currentSite);
                         PopulateEventsGrid(_currentSite);
+                        UpdateDirtyMarker();
                         _lblStatus.Text = T($"Загрузка событий из SN#F{_currentSite.SerialNumber} завершена.", "Downloading complete.");
                     }));
                 });
@@ -2480,6 +2531,10 @@ namespace FlukeEventView
                         lock (_portLock)
                         {
                             _serialPort.DiscardInBuffer();
+                            // Запись уставок перезапускает регистратор: его счётчик наработки
+                            // обнуляется. Это наше собственное действие, а не потеря синхронизации,
+                            // поэтому на 20 секунд отключаем детектор.
+                            _suppressSyncLossUntil = DateTime.Now.AddSeconds(20);
                             LogMessage($"Sending Setup (Try {tryNum}): {BitConverter.ToString(rawBytes)}");
                             PulseTxIndicator();
                             _serialPort.Write(rawBytes, 0, rawBytes.Length);
@@ -2503,7 +2558,7 @@ namespace FlukeEventView
                 {
                     _currentSite = SiteData.ParseFromDeviceHeader(verifyHdr, DateTime.Now);
                     _initialSetupLoadedFromDevice = true;
-                    this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber}]";
+                    this.Text = $"Fluke EventView VR101 - [SN F{_currentSite.SerialNumber}]";
                     UpdateSessionMinMax(_currentSite.LiveHnVolt, _currentSite.LiveNgVolt, _currentSite.LiveFreq);
                     PopulateSetupInputsFromSite(_currentSite);
                     SyncFilterDatePickersFromSite(_currentSite);
@@ -2668,11 +2723,578 @@ namespace FlukeEventView
             _lblInfoMode.Text = T(
                 $"Режим: {(s.Is220V ? "220В" : "110В")} / {(s.Is50Hz ? "50Гц" : "60Гц")} (Опции: 0x{s.OptionsByte:X2})",
                 $"Mode: {(s.Is220V ? "220V" : "110V")} / {(s.Is50Hz ? "50Hz" : "60Hz")} (Opt: 0x{s.OptionsByte:X2})");
+
+            // Подсказка к строке «Нейтраль-Земля»: сырое значение и байт конфигурации прибора
+            if (_toolTip != null && _lblRealGndVolt != null)
+            {
+                byte cfg = 0, ngRaw = 0;
+                if (s != null && s.RawHeader88 != null && s.RawHeader88.Length > 51)
+                {
+                    cfg = s.RawHeader88[51];
+                    ngRaw = s.RawHeader88[4];
+                }
+                bool ngOn = (cfg & 0x10) != 0;
+                _toolTip.SetToolTip(_lblRealGndVolt, T(
+                    $"Сырое значение из прибора: h[4] = {ngRaw} (0x{ngRaw:X2}). Байт конфигурации h[51] = 0x{cfg:X2}, бит 0x10 = {(ngOn ? 1 : 0)}. " +
+                    (ngOn ? "Канал N-G включён."
+                          : "Канал N-G выключен (режим TN): прибор его не измеряет, поэтому показывается 0 В."),
+                    $"Raw value from recorder: h[4] = {ngRaw} (0x{ngRaw:X2}). Config byte h[51] = 0x{cfg:X2}, bit 0x10 = {(ngOn ? 1 : 0)}. " +
+                    (ngOn ? "N-G channel is enabled."
+                          : "N-G channel is disabled (TN mode): the recorder does not measure it, so 0 V is shown.")));
+            }
+        }
+
+        // =========================================================================
+        // ПАРИТЕТ С ОРИГИНАЛЬНЫМ EVENTVIEW: сводные счётчики, Graph Setup, «не сохранено»
+        // =========================================================================
+        private Panel _pnlSummary;
+        private Label _lblSummary;
+        private Label _lblUnsavedMark;
+        private Panel _pnlGraphSetup;
+        private CheckBox _chkShowHnEvents;
+        private CheckBox _chkShowNgEvents;
+        private Label _lblPeriods;
+        private NumericUpDown _numPeriods;
+        private bool _hasUnsavedSessionData = false;
+        private ToolStripMenuItem _mnuFilePrint;
+        private ToolStripMenuItem _mnuFilePrintPreview;
+        private ToolStripMenuItem _mnuCalibration;
+        // --- Профили порогов по нормативным документам (ГОСТ, EN, IEC, ANSI) ---
+        private Label _lblPreset;
+        private ComboBox _cmbPreset;
+        private Button _btnApplyPreset;
+        private Panel _pnlPreset;
+        private Label _lblPresetNote;
+
+        private sealed class ThresholdPreset
+        {
+            public string NameRu, NameEn;
+            public int Sag, Swell;              // В, шаг прибора 2 В в режиме 220 В
+            public decimal MinF, MaxF;          // Гц, шаг 0,1 Гц
+            public string NoteRu, NoteEn;
+            public bool Arbitration;            // true — значения из нормативного документа (арбитражный профиль)
+        }
+
+        /// <summary>
+        /// Профили порогов, приведённые к шагам прибора (2 В для H-N, 0,1 Гц для частоты).
+        /// Первые профили — «арбитражные»: значения взяты из нормативных документов.
+        /// Остальные — «сценарии»: практические наборы под типовые объекты и задачи.
+        /// Пороги импульсов и N-G профилями не меняются: единого норматива для них нет.
+        /// </summary>
+        private static readonly ThresholdPreset[] _presets = new ThresholdPreset[]
+        {
+            // ================= АРБИТРАЖНЫЕ (по нормативным документам) =================
+            new ThresholdPreset
+            {
+                Arbitration = true,
+                NameRu = "Арбитраж — ГОСТ 32144-2013: ±10 % / ±0,2 Гц",
+                NameEn = "Arbitration — GOST 32144-2013: ±10 % / ±0.2 Hz",
+                Sag = 198, Swell = 242, MinF = 49.8m, MaxF = 50.2m,
+                NoteRu = "Напряжение: отклонение ±10 % от 220 В (198…242 В). Частота: ±0,2 Гц в течение 95 % времени недели.",
+                NoteEn = "Voltage: ±10 % of 220 V (198…242 V). Frequency: ±0.2 Hz for 95 % of a week."
+            },
+            new ThresholdPreset
+            {
+                Arbitration = true,
+                NameRu = "Арбитраж — ГОСТ 32144-2013: ±10 % / ±0,4 Гц",
+                NameEn = "Arbitration — GOST 32144-2013: ±10 % / ±0.4 Hz",
+                Sag = 198, Swell = 242, MinF = 49.6m, MaxF = 50.4m,
+                NoteRu = "Напряжение: ±10 % (198…242 В). Частота: ±0,4 Гц — предел для 100 % времени.",
+                NoteEn = "Voltage: ±10 % (198…242 V). Frequency: ±0.4 Hz — limit for 100 % of the time."
+            },
+            new ThresholdPreset
+            {
+                Arbitration = true,
+                NameRu = "Арбитраж — EN 50160: ±10 % / ±1 %",
+                NameEn = "Arbitration — EN 50160: ±10 % / ±1 %",
+                Sag = 198, Swell = 242, MinF = 49.5m, MaxF = 50.5m,
+                NoteRu = "Напряжение: ±10 % для 95 % времени недели (10-минутные RMS). Частота: ±1 % (49,5…50,5 Гц) для 99,5 % года.",
+                NoteEn = "Voltage: ±10 % for 95 % of a week (10-min RMS). Frequency: ±1 % (49.5…50.5 Hz) for 99.5 % of a year."
+            },
+            new ThresholdPreset
+            {
+                Arbitration = true,
+                NameRu = "Арбитраж — ANSI C84.1 Range A: ±5 %",
+                NameEn = "Arbitration — ANSI C84.1 Range A: ±5 %",
+                Sag = 210, Swell = 230, MinF = 49.5m, MaxF = 50.5m,
+                NoteRu = "Напряжение: Range A — ±5 % от 220 В (209…231 В, приведено к шагу 2 В: 210/230). Частота в ANSI C84.1 не нормируется — взята по EN 50160.",
+                NoteEn = "Voltage: Range A — ±5 % of 220 V (209…231 V, snapped to the 2 V step: 210/230). Frequency is not specified by ANSI C84.1 — taken from EN 50160."
+            },
+            new ThresholdPreset
+            {
+                Arbitration = true,
+                NameRu = "Арбитраж — IEC 61000-2-4, класс 2: ±10 %",
+                NameEn = "Arbitration — IEC 61000-2-4, class 2: ±10 %",
+                Sag = 198, Swell = 242, MinF = 49.5m, MaxF = 50.5m,
+                NoteRu = "Напряжение: ±10 % от номинала (198…242 В). Частота: ±1 % по EN 50160.",
+                NoteEn = "Voltage: ±10 % of nominal (198…242 V). Frequency: ±1 % per EN 50160."
+            },
+
+            // ================= СЦЕНАРИИ (практические наборы под объект) =================
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — чувствительная нагрузка (±7,5 %)",
+                NameEn = "Scenario — sensitive load (±7.5 %)",
+                Sag = 204, Swell = 236, MinF = 49.8m, MaxF = 50.2m,
+                NoteRu = "Для серверных, лабораторного и медицинского оборудования: ±7,5 % по напряжению (204…236 В) и частота ±0,2 Гц. Строже ГОСТ/EN, мягче диагностического режима.",
+                NoteEn = "For server rooms, laboratory and medical equipment: ±7.5 % voltage (204…236 V) and ±0.2 Hz frequency. Stricter than GOST/EN, looser than the diagnostic profile."
+            },
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — серверная / ЦОД: глубокие провалы",
+                NameEn = "Scenario — data centre: deep sags",
+                Sag = 187, Swell = 242, MinF = 49.5m, MaxF = 50.5m,
+                NoteRu = "Ловим провалы до −15 % (187 В) — то, что обычно приводит к перезагрузке ИТ-оборудования; всплески и частота — на уровне EN 50160.",
+                NoteEn = "Captures sags down to −15 % (187 V) — the level that usually reboots IT equipment; swells and frequency at EN 50160 level."
+            },
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — промышленный объект с двигателями",
+                NameEn = "Scenario — industrial site with motors",
+                Sag = 176, Swell = 253, MinF = 49.6m, MaxF = 50.4m,
+                NoteRu = "Широкие пороги ±15…20 % (176…253 В): на производстве кратковременные провалы при пуске двигателей — норма, важны длительные отклонения.",
+                NoteEn = "Wide limits ±15…20 % (176…253 V): in plants short sags from motor starts are normal, long deviations matter."
+            },
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — ИБП / резервное питание",
+                NameEn = "Scenario — UPS / backup power",
+                Sag = 176, Swell = 242, MinF = 49.5m, MaxF = 50.5m,
+                NoteRu = "Контроль перехода на ИБП: провалы до −20 % (176 В) и всплески +10 % (242 В); удобно для проверки работы источника резервного питания.",
+                NoteEn = "UPS transfer checks: sags down to −20 % (176 V) and swells +10 % (242 V); handy for validating backup power behaviour."
+            },
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — диагностика сети (±2 %)",
+                NameEn = "Scenario — network diagnostics (±2 %)",
+                Sag = 216, Swell = 224, MinF = 49.9m, MaxF = 50.1m,
+                NoteRu = "Максимальная чувствительность: пороги ±2 % от 220 В (216…224 В) и ±0,1 Гц. Даёт много событий — применять для обследования, а не для длительного мониторинга.",
+                NoteEn = "Maximum sensitivity: ±2 % of 220 V (216…224 V) and ±0.1 Hz. Produces many events — for surveys, not long-term monitoring."
+            },
+            new ThresholdPreset
+            {
+                NameRu = "Сценарий — только тяжёлые отклонения (±20 %)",
+                NameEn = "Scenario — severe deviations only (±20 %)",
+                Sag = 176, Swell = 264, MinF = 49.0m, MaxF = 51.0m,
+                NoteRu = "Фильтр грубых аварий: реакция только на ±20 % и частоту ±1 Гц. Полезно, когда нужен минимум ложных срабатываний.",
+                NoteEn = "Coarse fault filter: reacts only to ±20 % and ±1 Hz. Useful when false events must be minimised."
+            },
+
+            // ================= БАЗОВЫЙ =================
+            new ThresholdPreset
+            {
+                NameRu = "Базовый — заводские 220 В / 50 Гц",
+                NameEn = "Baseline — factory defaults 220 V / 50 Hz",
+                Sag = 210, Swell = 256, MinF = 48.8m, MaxF = 51.2m,
+                NoteRu = "Значения по умолчанию, которые использует эта программа для сети 220 В / 50 Гц.",
+                NoteEn = "Default values used by this program for a 220 V / 50 Hz network."
+            }
+        };
+
+        private uint _prevElapsedTicks = 0;
+        private DateTime _lastSyncLossReport = DateTime.MinValue;
+
+        // Пока это время не наступило, «потеря синхронизации» не фиксируется:
+        // счётчик наработки прибора обнуляется нашей же записью уставок.
+        private DateTime _suppressSyncLossUntil = DateTime.MinValue;
+
+        // Последние залогированные «сырые» значения канала N-G и байта конфигурации прибора
+        private int _lastLoggedNgRaw = -1;
+        private int _lastLoggedCfgByte = -1;
+
+        /// <summary>
+        /// Пишет в «Лог обмена» сырые байты заголовка, относящиеся к каналу «нейтраль — земля»:
+        /// h[3] (линия), h[4] (сырое значение N-G) и h[51] (байт конфигурации с битом 0x10).
+        /// Строка добавляется только при изменении значений, чтобы не забивать лог каждые 1,5 с.
+        /// </summary>
+        private void LogRawHeaderDetails(byte[] h)
+        {
+            if (h == null || h.Length < 88) return;
+
+            int ngRaw = h[4];
+            int cfg = h[51];
+            if (ngRaw == _lastLoggedNgRaw && cfg == _lastLoggedCfgByte) return;
+
+            _lastLoggedNgRaw = ngRaw;
+            _lastLoggedCfgByte = cfg;
+
+            double vMult = (cfg & 0x80) != 0 ? 2.0 : 1.0;
+            bool ngOn = (cfg & 0x10) != 0;
+
+            LogMessage("RAW: " + T(
+                $"линия h[3]={h[3]} (0x{h[3]:X2}) → {h[3] * vMult:0} В; " +
+                $"N-G h[4]={ngRaw} (0x{ngRaw:X2}); конфигурация h[51]=0x{cfg:X2}, бит 0x10={(ngOn ? 1 : 0)} " +
+                $"→ канал N-G {(ngOn ? "включён, показываем " + (ngRaw * 0.25) + " В" : "выключен (TN), показываем 0 В")}",
+                $"line h[3]={h[3]} (0x{h[3]:X2}) -> {h[3] * vMult:0} V; " +
+                $"N-G h[4]={ngRaw} (0x{ngRaw:X2}); config h[51]=0x{cfg:X2}, bit 0x10={(ngOn ? 1 : 0)} " +
+                $"-> N-G channel {(ngOn ? "enabled, showing " + (ngRaw * 0.25) + " V" : "disabled (TN), showing 0 V")}"));
+        }
+
+        /// <summary>
+        /// События, обнаруженные самой программой (потеря синхронизации с прибором).
+        /// В файл .VER не сохраняются, в таблице помечаются как «обнаружено программой».
+        /// </summary>
+        private readonly List<EventRecord> _syntheticEvents = new List<EventRecord>();
+
+        /// <summary>
+        /// Достраивает элементы, которых не было в первой версии: панель сводки на вкладке
+        /// событий и панель «Graph Setup» на вкладке графиков (как в оригинале).
+        /// </summary>
+        private void BuildParityExtras()
+        {
+            // --- Панель сводки по типам событий (вкладка Events) ---
+            _pnlSummary = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 26,
+                Padding = new Padding(8, 4, 8, 2),
+                BackColor = Color.FromArgb(232, 240, 248)
+            };
+
+            _lblSummary = new Label
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(20, 40, 70)
+            };
+
+            _lblUnsavedMark = new Label
+            {
+                Dock = DockStyle.Right,
+                AutoSize = true,
+                TextAlign = ContentAlignment.MiddleRight,
+                Font = new Font("MS Sans Serif", 8.5f, FontStyle.Bold),
+                ForeColor = Color.Firebrick,
+                Visible = false
+            };
+
+            _pnlSummary.Controls.Add(_lblSummary);
+            _pnlSummary.Controls.Add(_lblUnsavedMark);
+            _tabEvents.Controls.Add(_pnlSummary);
+            _pnlSummary.BringToFront();
+            if (_pnlEventsFilter != null) _pnlEventsFilter.BringToFront();
+
+            // --- Панель «Graph Setup» (вкладка Graphs) ---
+            _pnlGraphSetup = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 32,
+                Padding = new Padding(8, 5, 8, 3),
+                BackColor = Color.FromArgb(240, 244, 248)
+            };
+
+            _chkShowHnEvents = new CheckBox
+            {
+                Checked = true,
+                AutoSize = true,
+                Location = new Point(8, 6)
+            };
+            _chkShowHnEvents.CheckedChanged += (s, e) => _pnlCharts?.Invalidate();
+
+            _chkShowNgEvents = new CheckBox
+            {
+                Checked = true,
+                AutoSize = true,
+                Location = new Point(210, 6)
+            };
+            _chkShowNgEvents.CheckedChanged += (s, e) => _pnlCharts?.Invalidate();
+
+            _lblPeriods = new Label
+            {
+                AutoSize = true,
+                Location = new Point(410, 8),
+                Font = new Font("MS Sans Serif", 8.5f)
+            };
+
+            _numPeriods = new NumericUpDown
+            {
+                Location = new Point(500, 5),
+                Width = 60,
+                Minimum = 1,
+                Maximum = 60,
+                Value = 12
+            };
+            _numPeriods.ValueChanged += (s, e) => _pnlCharts?.Invalidate();
+
+            _pnlGraphSetup.Controls.AddRange(new Control[]
+            {
+                _chkShowHnEvents, _chkShowNgEvents, _lblPeriods, _numPeriods
+            });
+            _tabCharts.Controls.Add(_pnlGraphSetup);
+            _pnlGraphSetup.BringToFront();
+            // Полоса выбора типа графика должна оставаться верхней
+            foreach (Control c in _tabCharts.Controls)
+            {
+                if (c is FlowLayoutPanel) { c.BringToFront(); break; }
+            }
+
+            BuildPresetPanel();
+
+            // Пункты печати в меню «Файл» (как File -> Print в оригинале)
+            if (_mnuFile != null)
+            {
+                _mnuFilePrint = new ToolStripMenuItem(null, null, (s, e) => PrintReport())
+                {
+                    ShortcutKeys = Keys.Control | Keys.P
+                };
+                _mnuFilePrintPreview = new ToolStripMenuItem(null, null, (s, e) => PrintReportPreview());
+
+                int insertAt = _mnuFile.DropDownItems.IndexOf(_mnuFileExit);
+                if (insertAt < 0) insertAt = _mnuFile.DropDownItems.Count;
+
+                _mnuFile.DropDownItems.Insert(insertAt, new ToolStripSeparator());
+                _mnuFile.DropDownItems.Insert(insertAt + 1, _mnuFilePrintPreview);
+                _mnuFile.DropDownItems.Insert(insertAt + 2, _mnuFilePrint);
+            }
+
+            // Пункт сервисной калибровки в меню «Связь» (аналог «VR101 Calibration»)
+            if (_mnuComm != null)
+            {
+                _mnuCalibration = new ToolStripMenuItem(null, null, (s, e) => ShowCalibrationDialog());
+                _mnuComm.DropDownItems.Add(new ToolStripSeparator());
+                _mnuComm.DropDownItems.Add(_mnuCalibration);
+            }
+
+            UpdateDirtyMarker();
+        }
+
+        /// <summary>
+        /// Тексты новых элементов на выбранном языке.
+        /// </summary>
+        private void ApplyParityLocalization()
+        {
+            if (_chkShowHnEvents != null)
+                _chkShowHnEvents.Text = T("Показывать события H-N", "Show Hot to Neutral Events");
+            if (_chkShowNgEvents != null)
+                _chkShowNgEvents.Text = T("Показывать события N-G", "Show Neutral to Ground Events");
+            if (_lblPeriods != null)
+                _lblPeriods.Text = T("Периодов:", "Periods:");
+            if (_numPeriods != null && _lblPeriods != null)
+                _numPeriods.Left = _lblPeriods.Right + 6;
+
+            if (_chkShowHnEvents != null)
+            {
+                _toolTip?.SetToolTip(_chkShowHnEvents,
+                    T("Учитывать события «фаза — нейтраль» на графиках",
+                      "Include Hot-to-Neutral events in graphs"));
+                _toolTip?.SetToolTip(_chkShowNgEvents,
+                    T("Учитывать события «нейтраль — земля» на графиках",
+                      "Include Neutral-to-Ground events in graphs"));
+                _toolTip?.SetToolTip(_numPeriods,
+                    T("Количество периодов (столбцов) на сводной гистограмме",
+                      "Number of periods (bars) in the Quick Summary chart"));
+                _toolTip?.SetToolTip(_lblUnsavedMark,
+                    T("Данные считаны из прибора, но ещё не сохранены в файл .VER",
+                      "Data was downloaded from the recorder but not saved to a .VER file"));
+            }
+
+            if (_mnuFilePrint != null)
+                _mnuFilePrint.Text = T("&Печать отчёта...", "&Print report...");
+            if (_mnuFilePrintPreview != null)
+                _mnuFilePrintPreview.Text = T("Предварительный просмотр", "Print pre&view");
+            if (_mnuCalibration != null)
+                _mnuCalibration.Text = T("Калибровка VR101...", "VR101 Calibration...");
+
+            if (_lblPreset != null) _lblPreset.Text = T("Профиль порогов:", "Threshold preset:");
+            if (_btnApplyPreset != null) _btnApplyPreset.Text = T("Применить профиль", "Apply preset");
+            if (_lblPresetNote != null)
+                _lblPresetNote.Text = T("меняет только Sag / Swell и частоту; импульсы и N-G не трогает",
+                                        "changes Sag / Swell and frequency only; transients and N-G untouched");
+            if (_cmbPreset != null)
+            {
+                for (int i = 0; i < _presets.Length && i < _cmbPreset.Items.Count; i++)
+                {
+                    var p = _presets[i];
+                    _cmbPreset.Items[i] = (p.Arbitration ? "★ " : "") + T(p.NameRu, p.NameEn);
+                }
+
+                int pIdx = _cmbPreset.SelectedIndex;
+                if (pIdx >= 0 && pIdx < _presets.Length && _toolTip != null)
+                    _toolTip.SetToolTip(_cmbPreset, T(_presets[pIdx].NoteRu, _presets[pIdx].NoteEn));
+            }
+
+            UpdateEventSummary(_currentSite);
+            UpdateDirtyMarker();
+        }
+
+        /// <summary>
+        /// Пересчитывает сводку по типам событий (аналог счётчиков из отчёта оригинала).
+        /// </summary>
+        private void UpdateEventSummary(SiteData s)
+        {
+            if (_lblSummary == null) return;
+
+            int swells = 0, sags = 0, transients = 0, outages = 0, freq = 0, syncLoss = 0, total = 0;
+            if (s != null && s.HasValidData)
+            {
+                var all = new List<EventRecord>();
+                all.AddRange(s.Events);
+                all.AddRange(s.OpenEvents);
+                all.AddRange(_syntheticEvents);
+
+                foreach (var ev in all)
+                {
+                    total++;
+                    switch (ev.Category)
+                    {
+                        case EventCategory.HnSwell:
+                        case EventCategory.NgSwell:
+                            swells++;
+                            break;
+                        case EventCategory.HnSag:
+                            sags++;
+                            break;
+                        case EventCategory.HnTransient:
+                        case EventCategory.NgTransient:
+                            transients++;
+                            break;
+                        case EventCategory.Outage:
+                            outages++;
+                            break;
+                        case EventCategory.LossOfSync:
+                            syncLoss++;
+                            break;
+                        case EventCategory.HighFreq:
+                        case EventCategory.LowFreq:
+                            freq++;
+                            break;
+                    }
+                }
+            }
+
+            string text = T(
+                $"Событий: {total}   ·   всплески: {swells}   ·   просадки: {sags}   ·   импульсы: {transients}   ·   обрывы: {outages}   ·   частота: {freq}   ·   потеря синхр.: {syncLoss}",
+                $"Events: {total}   ·   swells: {swells}   ·   sags: {sags}   ·   transients: {transients}   ·   outages: {outages}   ·   frequency: {freq}   ·   sync loss: {syncLoss}");
+
+            if (s != null && s.HasValidData && s.IsMemoryFull)
+                text += T("   ·   ПАМЯТЬ ЗАПОЛНЕНА", "   ·   RECORDER FULL!");
+
+            _lblSummary.Text = text;
+        }
+
+        /// <summary>
+        /// Панель выбора профиля порогов (по нормативным документам) на вкладке «Статус».
+        /// </summary>
+        private void BuildPresetPanel()
+        {
+            if (_tabStatus == null) return;
+
+            _pnlPreset = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 36,
+                Padding = new Padding(8, 6, 8, 4),
+                BackColor = Color.FromArgb(236, 244, 236)
+            };
+
+            _lblPreset = new Label { AutoSize = true, Location = new Point(8, 10) };
+
+            _cmbPreset = new ComboBox
+            {
+                Width = 260,
+                Left = 150,
+                Top = 6,
+                DropDownStyle = ComboBoxStyle.DropDownList
+            };
+            for (int i = 0; i < _presets.Length; i++) _cmbPreset.Items.Add(i.ToString());
+            _cmbPreset.SelectedIndex = 0;
+            _cmbPreset.SelectedIndexChanged += (s, e) =>
+            {
+                int idx = _cmbPreset.SelectedIndex;
+                if (idx >= 0 && idx < _presets.Length && _toolTip != null)
+                    _toolTip.SetToolTip(_cmbPreset, T(_presets[idx].NoteRu, _presets[idx].NoteEn));
+            };
+
+            _btnApplyPreset = new Button
+            {
+                Left = 418,
+                Top = 4,
+                Width = 150,
+                Height = 26,
+                BackColor = Color.FromArgb(214, 236, 214)
+            };
+            _btnApplyPreset.Click += (s, e) => ApplySelectedPreset();
+
+            _lblPresetNote = new Label
+            {
+                AutoSize = true,
+                Left = 578,
+                Top = 10,
+                ForeColor = Color.DimGray
+            };
+
+            _pnlPreset.Controls.AddRange(new Control[] { _lblPreset, _cmbPreset, _btnApplyPreset, _lblPresetNote });
+            _tabStatus.Controls.Add(_pnlPreset);
+            _pnlPreset.BringToFront();
+        }
+
+        /// <summary>
+        /// Переносит значения выбранного профиля в поля порогов (без записи в прибор).
+        /// </summary>
+        private void ApplySelectedPreset()
+        {
+            int idx = _cmbPreset != null ? _cmbPreset.SelectedIndex : -1;
+            if (idx < 0 || idx >= _presets.Length) return;
+
+            var pr = _presets[idx];
+
+            SetSafeNum(_numHnSag, pr.Sag);
+            SetSafeNum(_numHnSwell, pr.Swell);
+            SetSafeNum(_numMinFreq, pr.MinF);
+            SetSafeNum(_numMaxFreq, pr.MaxF);
+
+            string kind = pr.Arbitration
+                ? T("Арбитражный профиль", "Arbitration profile")
+                : T("Профиль-сценарий", "Scenario profile");
+
+            string msg = T(
+                $"{kind} «{pr.NameRu}» подставлен: просадка {pr.Sag} В, всплеск {pr.Swell} В, частота {pr.MinF:0.0}…{pr.MaxF:0.0} Гц. Пороги импульсов и N-G не изменялись. Проверьте и нажмите «Записать уставки».",
+                $"{kind} \"{pr.NameEn}\" applied: sag {pr.Sag} V, swell {pr.Swell} V, frequency {pr.MinF:0.0}…{pr.MaxF:0.0} Hz. Transient and N-G thresholds were not changed. Review and press Send Setup.");
+
+            _lblStatus.Text = msg;
+            LogMessage(msg);
+        }
+
+        /// <summary>
+        /// Включает/выключает пометку «не сохранено» рядом со сводкой.
+        /// </summary>
+        private void UpdateDirtyMarker()
+        {
+            if (_lblUnsavedMark == null) return;
+            _lblUnsavedMark.Text = T("(не сохранено)", "(not saved)");
+            _lblUnsavedMark.Visible = _hasUnsavedSessionData;
+        }
+
+        /// <summary>
+        /// Список событий для графиков: фильтр по типу/дате (если включён) плюс
+        /// тумблеры «показывать H-N / N-G», как в диалоге Graph Setup оригинала.
+        /// </summary>
+        private List<EventRecord> GetEventsForGraphs()
+        {
+            var list = GetEventsForChartsAndExport();
+            bool showHn = _chkShowHnEvents == null || _chkShowHnEvents.Checked;
+            bool showNg = _chkShowNgEvents == null || _chkShowNgEvents.Checked;
+            if (showHn && showNg) return list;
+
+            return list.Where(ev =>
+            {
+                bool isNg = ev.IsNgTransient || ev.Category == EventCategory.NgSwell;
+                bool isHn = ev.Category == EventCategory.HnSwell
+                         || ev.Category == EventCategory.HnSag
+                         || ev.Category == EventCategory.HnTransient;
+
+                if (isNg) return showNg;
+                if (isHn) return showHn;
+                return true; // события частоты и обрывы питания показываем всегда
+            }).ToList();
         }
 
         private void PopulateEventsGrid(SiteData s)
         {
             _gridEvents.Rows.Clear();
+            UpdateEventSummary(s);
 
             if (s == null || !s.HasValidData || (s.StoredEventCount == 0 && s.Events.Count == 0))
             {
@@ -2682,7 +3304,7 @@ namespace FlukeEventView
                 return;
             }
 
-            int totalRecords = s.OpenEvents.Count + s.Events.Count;
+            int totalRecords = s.OpenEvents.Count + s.Events.Count + _syntheticEvents.Count;
             int shownRecords = 0;
 
             foreach (var openEv in s.OpenEvents)
@@ -2701,6 +3323,26 @@ namespace FlukeEventView
                 _gridEvents.Rows[rIdx].Height = _gridEvents.RowTemplate.Height;
                 _gridEvents.Rows[rIdx].DefaultCellStyle.BackColor = Color.FromArgb(215, 235, 255);
                 _gridEvents.Rows[rIdx].DefaultCellStyle.Font = new Font(_gridEvents.Font, FontStyle.Bold);
+                shownRecords++;
+            }
+
+            // События, обнаруженные самой программой (потеря синхронизации с прибором)
+            foreach (var syn in _syntheticEvents)
+            {
+                if (!MatchesEventFilter(syn)) continue;
+
+                int rIdx = _gridEvents.Rows.Add(
+                    0,
+                    syn.Timestamp.ToString("dd.MM.yyyy HH:mm:ss"),
+                    syn.GetLocalizedEventName(_lang),
+                    syn.ExtremeText,
+                    syn.GetLocalizedEndText(_lang),
+                    T("обнаружено программой", "detected by program")
+                );
+                _gridEvents.Rows[rIdx].Tag = syn;
+                _gridEvents.Rows[rIdx].Height = _gridEvents.RowTemplate.Height;
+                _gridEvents.Rows[rIdx].DefaultCellStyle.BackColor = Color.FromArgb(255, 246, 205);
+                _gridEvents.Rows[rIdx].DefaultCellStyle.Font = new Font(_gridEvents.Font, FontStyle.Italic);
                 shownRecords++;
             }
 
@@ -2777,7 +3419,7 @@ namespace FlukeEventView
 
         private void DrawQuickSummaryBarChart(Graphics g, Rectangle rect)
         {
-            var listToPlot = GetEventsForChartsAndExport();
+            var listToPlot = GetEventsForGraphs();
             if (listToPlot.Count == 0)
             {
                 using (var fnt = new Font("MS Sans Serif", 10f * _fontScale))
@@ -2794,37 +3436,141 @@ namespace FlukeEventView
             using (var valFont = new Font("Arial", 9.5f * _fontScale, FontStyle.Bold))
             {
                 g.DrawString(
-                    T($"Сводная гистограмма событий (Quick Summary) — SN F{_currentSite.SerialNumber}",
-                      $"Quick Summary (Bar Graph) — SN F{_currentSite.SerialNumber}"),
+                    T($"Сводная гистограмма: событий за период — SN F{_currentSite.SerialNumber}",
+                      $"Quick Summary: Events per Period — SN F{_currentSite.SerialNumber}"),
                     titleFont, Brushes.Black, new Point(20, 15));
 
-                var groups = listToPlot.GroupBy(ev => ev.GetLocalizedEventName(_lang)).ToList();
-                int startX = 70, startY = rect.Height - 65, colWidth = (int)(120 * _fontScale);
-                int maxCount = Math.Max(1, groups.Max(gr => gr.Count()));
+                int periods = _numPeriods != null ? (int)_numPeriods.Value : 12;
+                periods = Math.Max(1, Math.Min(periods, 60));
 
-                g.DrawLine(Pens.Black, startX, startY, startX + groups.Count * (colWidth + 28), startY);
-                g.DrawLine(Pens.Black, startX, 55, startX, startY);
+                DateTime minT = listToPlot.Min(ev => ev.Timestamp);
+                DateTime maxT = listToPlot.Max(ev => ev.Timestamp);
+                if (maxT <= minT) maxT = minT.AddMinutes(1);
+                double spanSec = (maxT - minT).TotalSeconds;
 
-                int idx = 0;
-                foreach (var gr in groups)
+                var counts = new int[periods];
+                foreach (var ev in listToPlot)
                 {
-                    int barH = (int)((gr.Count() / (double)maxCount) * Math.Max(50, rect.Height - 150));
-                    int x = startX + 15 + idx * (colWidth + 28);
+                    double rel = (ev.Timestamp - minT).TotalSeconds / spanSec;
+                    int p = (int)(rel * periods);
+                    if (p < 0) p = 0;
+                    if (p >= periods) p = periods - 1;
+                    counts[p]++;
+                }
+
+                int startX = (int)(70 * _fontScale);
+                int startY = rect.Height - (int)(62 * _fontScale);
+                int plotH = Math.Max(60, startY - (int)(70 * _fontScale));
+                int plotW = Math.Max(120, rect.Width - startX - 30);
+                int slot = Math.Max(6, plotW / periods);
+                int barW = Math.Max(4, slot - Math.Max(2, slot / 8));
+                int maxCount = Math.Max(1, counts.Max());
+
+                g.DrawLine(Pens.Black, startX, startY, startX + periods * slot, startY);
+                g.DrawLine(Pens.Black, startX, startY - plotH, startX, startY);
+
+                g.DrawString(T("событий", "events"), labelFont, Brushes.DimGray, new Point(4, startY - plotH - 16));
+                g.DrawString(T("окончание периода", "period ending"), labelFont, Brushes.DimGray, new Point(startX, startY + 34));
+
+                int labelEvery = Math.Max(1, (int)Math.Ceiling(periods / 12.0));
+                for (int i = 0; i < periods; i++)
+                {
+                    int barH = counts[i] == 0 ? 0 : Math.Max(2, (int)((counts[i] / (double)maxCount) * (plotH - 10)));
+                    int x = startX + i * slot + (slot - barW) / 2;
                     int y = startY - barH;
 
-                    g.FillRectangle(Brushes.SteelBlue, x, y, colWidth, barH);
-                    g.DrawRectangle(Pens.DarkBlue, x, y, colWidth, barH);
-                    g.DrawString(gr.Key, labelFont, Brushes.Black, new Point(x, startY + 6));
-                    g.DrawString(gr.Count().ToString(), valFont, Brushes.DarkRed, new Point(x + colWidth / 2 - 10, y - (int)(20 * _fontScale)));
-                    idx++;
+                    if (barH > 0)
+                    {
+                        g.FillRectangle(Brushes.SteelBlue, x, y, barW, barH);
+                        g.DrawRectangle(Pens.DarkBlue, x, y, barW, barH);
+                        if (slot >= 18)
+                        {
+                            g.DrawString(counts[i].ToString(), valFont, Brushes.DarkRed,
+                                new Point(x + barW / 2 - 5, y - (int)(17 * _fontScale)));
+                        }
+                    }
+
+                    if (i % labelEvery == 0)
+                    {
+                        DateTime endT = minT.AddSeconds(spanSec * (i + 1) / periods);
+                        g.DrawString(endT.ToString("dd.MM HH:mm"), labelFont, Brushes.Black,
+                            new Point(startX + i * slot, startY + 6));
+                    }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Извлекает из записи события длительность (с) и амплитуду (В) для графика
+        /// распределения. Для частотных событий «вольтовой» амплитуды нет — возвращает false.
+        /// </summary>
+        private bool TryMeasureEvent(EventRecord ev, out double seconds, out double volts)
+        {
+            seconds = 0;
+            volts = 0;
+
+            byte[] b = ev.Raw;
+            if (b == null || b.Length < 8) return false;
+
+            byte type = b[0];
+            double vMult = (_currentSite != null && _currentSite.Is220V) ? 2.0 : 1.0;
+            double lineFreq = (_currentSite != null && _currentSite.Is50Hz) ? 50.0 : 60.0;
+            bool ng025 = _currentSite != null && _currentSite.NgScale025;
+
+            uint rawDur = (uint)((b[2] << 16) | (b[3] << 8) | b[4]);
+            bool durIn8SecTicks = (type == 0x06 || type == 0x86 || type == 0x08 || type == 0x88);
+            seconds = durIn8SecTicks ? rawDur * 8.0 : ((rawDur + 1) / 2.0) / lineFreq;
+
+            switch (type)
+            {
+                case 0x01:
+                case 0x02:
+                case 0x03:
+                case 0x04:
+                    // Импульс: амплитуда пиковая в вольтах, длительность в записи не сохраняется
+                    volts = b[1] * 10.0;
+                    seconds = 0;
+                    return true;
+
+                case 0x05:
+                case 0x85:
+                case 0x16:
+                case 0x06:
+                case 0x86:
+                case 0x17:
+                    volts = b[1] * vMult;
+                    return true;
+
+                case 0x09:
+                case 0x89:
+                case 0x12:
+                case 0x14:
+                    volts = ng025 ? b[1] * 0.25 : b[1];
+                    return true;
+
+                case 0x80:
+                    volts = 0;
+                    return true;
+
+                default:
+                    // Частотные и неизвестные события в распределении не участвуют
+                    return false;
             }
         }
 
         private void DrawEventDistributionTimeline(Graphics g, Rectangle rect)
         {
-            var listToPlot = GetEventsForChartsAndExport();
-            if (listToPlot.Count == 0)
+            var all = GetEventsForGraphs();
+
+            var pts = new List<Tuple<EventRecord, double, double>>();
+            foreach (var ev in all)
+            {
+                double sec, volt;
+                if (!TryMeasureEvent(ev, out sec, out volt)) continue;
+                pts.Add(Tuple.Create(ev, sec, volt));
+            }
+
+            if (pts.Count == 0)
             {
                 using (var fnt = new Font("MS Sans Serif", 10f * _fontScale))
                 {
@@ -2836,29 +3582,78 @@ namespace FlukeEventView
             }
 
             using (var titleFont = new Font("MS Sans Serif", 11f * _fontScale, FontStyle.Bold))
+            using (var axisFont = new Font("Arial", 8.5f * _fontScale))
+            using (var tickFont = new Font("Arial", 7.5f * _fontScale))
             {
                 g.DrawString(
-                    T($"Распределение событий во времени (Event Distribution) — SN F{_currentSite.SerialNumber}",
-                      $"Event Distribution Graph — SN F{_currentSite.SerialNumber}"),
-                    titleFont, Brushes.Black, new Point(20, 15));
+                    T($"Распределение событий — SN F{_currentSite.SerialNumber}",
+                      $"Event Distribution — SN F{_currentSite.SerialNumber}"),
+                    titleFont, Brushes.Black, new Point(20, 12));
 
-                int ox = 70, oy = rect.Height - 55, w = Math.Max(100, rect.Width - 115), h = Math.Max(100, rect.Height - 130);
+                // Легенда как в оригинале: HN Events / NG Events / Outage and Spikes
+                int lx = Math.Max(320, rect.Width - (int)(330 * _fontScale));
+                int ly = 14;
+                g.FillEllipse(Brushes.RoyalBlue, lx, ly + 2, 10, 10);
+                g.DrawString(T("события H-N", "HN Events"), tickFont, Brushes.Black, new Point(lx + 14, ly));
+                g.FillEllipse(Brushes.SeaGreen, lx + (int)(110 * _fontScale), ly + 2, 10, 10);
+                g.DrawString(T("события N-G", "NG Events"), tickFont, Brushes.Black, new Point(lx + (int)(124 * _fontScale), ly));
+                g.FillEllipse(Brushes.Crimson, lx + (int)(220 * _fontScale), ly + 2, 10, 10);
+                g.DrawString(T("обрывы и импульсы", "Outage and Spikes"), tickFont, Brushes.Black, new Point(lx + (int)(234 * _fontScale), ly));
+
+                int ox = (int)(82 * _fontScale);
+                int oy = rect.Height - (int)(66 * _fontScale);
+                int w = Math.Max(150, rect.Width - ox - 40);
+                int h = Math.Max(90, oy - (int)(62 * _fontScale));
+
+                double maxSec = Math.Max(0.5, pts.Max(p => p.Item2));
+                double maxVolt = Math.Max(50.0, pts.Max(p => p.Item3));
+
+                // Округляем верхние пределы до «красивого» значения
+                maxSec = NiceCeil(maxSec);
+                maxVolt = NiceCeil(maxVolt);
+
                 g.DrawLine(Pens.Black, ox, oy, ox + w, oy);
                 g.DrawLine(Pens.Black, ox, oy - h, ox, oy);
 
-                DateTime minT = listToPlot.Min(ev => ev.Timestamp);
-                DateTime maxT = listToPlot.Max(ev => ev.Timestamp);
-                double totalSec = Math.Max(1.0, (maxT - minT).TotalSeconds);
-
-                foreach (var ev in listToPlot)
+                for (int i = 0; i <= 4; i++)
                 {
-                    double sec = (ev.Timestamp - minT).TotalSeconds;
-                    int px = ox + (int)((sec / totalSec) * w);
-                    int py = oy - (ev.Raw[1] % Math.Max(20, h - 20)) - 10;
-                    Brush b = ev.IsTransient ? Brushes.Crimson : Brushes.RoyalBlue;
-                    g.FillEllipse(b, px - 4, py - 4, 8, 8);
+                    int gy = oy - (int)(h * i / 4.0);
+                    g.DrawLine(Pens.Gainsboro, ox, gy, ox + w, gy);
+                    g.DrawString((maxVolt * i / 4.0).ToString("0"), tickFont, Brushes.DimGray, new Point(ox - 34, gy - 7));
+
+                    int gx = ox + (int)(w * i / 4.0);
+                    g.DrawLine(Pens.Gainsboro, gx, oy, gx, oy - h);
+                    g.DrawString((maxSec * i / 4.0).ToString("0.##"), tickFont, Brushes.DimGray, new Point(gx - 10, oy + 4));
                 }
+
+                foreach (var p in pts)
+                {
+                    double sec = p.Item2, volt = p.Item3;
+                    int px = ox + (int)((sec / maxSec) * (w - 6));
+                    int py = oy - (int)((volt / maxVolt) * (h - 6));
+
+                    Brush br;
+                    if (p.Item1.Category == EventCategory.Outage || p.Item1.IsTransient) br = Brushes.Crimson;
+                    else if (p.Item1.Category == EventCategory.NgSwell || p.Item1.IsNgTransient) br = Brushes.SeaGreen;
+                    else br = Brushes.RoyalBlue;
+
+                    g.FillEllipse(br, px - 4, py - 4, 8, 8);
+                }
+
+                g.DrawString(T("длительность, с", "Duration (seconds)"), axisFont, Brushes.Black,
+                    new Point(ox + w / 2 - 40, oy + 20));
+                g.DrawString(T("амплитуда, В", "Magnitude (volts)"), axisFont, Brushes.Black,
+                    new Point(6, oy - h / 2));
             }
+        }
+
+        private static double NiceCeil(double value)
+        {
+            if (value <= 0) return 1;
+            double exp = Math.Pow(10, Math.Floor(Math.Log10(value)));
+            double mant = value / exp;
+            double step = mant <= 1 ? 1 : mant <= 2 ? 2 : mant <= 5 ? 5 : 10;
+            return step * exp;
         }
 
         private void DrawSingleTransientSineWaveGraph(Graphics g, Rectangle rect)
@@ -3026,6 +3821,210 @@ namespace FlukeEventView
         // =========================================================================
         // ОТКРЫТИЕ И СОХРАНЕНИЕ ФАЙЛОВ СЕССИИ (.VER) И ЭКСПОРТ (.CSV)
         // =========================================================================
+        // =========================================================================
+        // ПЕЧАТЬ ОТЧЁТА (аналог File -> Print оригинала)
+        // =========================================================================
+        private List<EventRecord> _printEvents = new List<EventRecord>();
+        private int _printRowIndex = 0;
+        private int _printPageNo = 1;
+        private string _printSubtitle = "";
+
+        private void PrintReportPreview()
+        {
+            PreparePrintSession();
+            if (_printEvents.Count == 0 && !_currentSite.HasValidData)
+            {
+                MessageBox.Show(T("Нет данных для печати!", "Nothing to print!"),
+                    "Fluke EventView", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var doc = CreateReportPrintDocument();
+            using (var preview = new PrintPreviewDialog
+            {
+                Document = doc,
+                Width = 1000,
+                Height = 760,
+                UseAntiAlias = true
+            })
+            {
+                preview.ShowDialog(this);
+            }
+            doc.Dispose();
+        }
+
+        private void PrintReport()
+        {
+            PreparePrintSession();
+            var doc = CreateReportPrintDocument();
+            using (var dlg = new PrintDialog { Document = doc, UseEXDialog = true })
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    try
+                    {
+                        doc.Print();
+                        LogMessage("Report sent to printer.");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"Print error: {ex.Message}");
+                        MessageBox.Show(ex.Message, T("Ошибка печати", "Print Error"),
+                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
+            }
+            doc.Dispose();
+        }
+
+        /// <summary>
+        /// Фиксирует данные на момент печати: заголовок сессии и список событий
+        /// (с учётом включённого фильтра по типу и дате).
+        /// </summary>
+        private void PreparePrintSession()
+        {
+            _printEvents = GetEventsForChartsAndExport();
+            _printRowIndex = 0;
+            _printPageNo = 1;
+
+            if (_currentSite == null || !_currentSite.HasValidData)
+            {
+                _printSubtitle = T("Данные не загружены", "No data loaded");
+                return;
+            }
+
+            _printSubtitle = T(
+                $"Прибор SN F{_currentSite.SerialNumber} · прошивка {_currentSite.FirmwareVersion} · " +
+                $"{(_currentSite.Is220V ? "220 В" : "110 В")} / {(_currentSite.Is50Hz ? "50 Гц" : "60 Гц")} · " +
+                $"запись с {_currentSite.StartTime:dd.MM.yyyy HH:mm} по {_currentSite.EndTime:dd.MM.yyyy HH:mm}",
+                $"Recorder SN F{_currentSite.SerialNumber} · firmware {_currentSite.FirmwareVersion} · " +
+                $"{(_currentSite.Is220V ? "220 V" : "110 V")} / {(_currentSite.Is50Hz ? "50 Hz" : "60 Hz")} · " +
+                $"from {_currentSite.StartTime:dd.MM.yyyy HH:mm} to {_currentSite.EndTime:dd.MM.yyyy HH:mm}");
+        }
+
+        private PrintDocument CreateReportPrintDocument()
+        {
+            var doc = new PrintDocument();
+            doc.DocumentName = T("Отчёт Fluke EventView", "Fluke EventView Report");
+            doc.PrintPage += ReportPrintPage;
+            return doc;
+        }
+
+        private void ReportPrintPage(object sender, PrintPageEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            RectangleF bounds = e.MarginBounds;
+
+            float y = bounds.Top;
+            float left = bounds.Left;
+            float width = bounds.Width;
+
+            using (var h1 = new Font("Arial", 14f, FontStyle.Bold))
+            using (var h2 = new Font("Arial", 9.5f, FontStyle.Bold))
+            using (var body = new Font("Arial", 9f))
+            using (var small = new Font("Arial", 8f))
+            {
+                // Заголовок страницы
+                g.DrawString(T("FLUKE EVENTVIEW — ОТЧЁТ ПО СЕССИИ", "FLUKE EVENTVIEW — SITE REPORT"),
+                    h1, Brushes.Black, left, y);
+                y += 26;
+
+                g.DrawString(_printSubtitle, body, Brushes.Black, left, y);
+                y += 18;
+
+                if (_currentSite != null && _currentSite.HasValidData)
+                {
+                    string thr = T(
+                        $"Пороги: всплеск {_currentSite.HnSwell} В · просадка {_currentSite.HnSag} В · импульс {_currentSite.HnImpulse} Вп · " +
+                        $"N-G {_currentSite.NgSurge} В / {_currentSite.NgImpulse} Вп · частота {_currentSite.MinFreq:0.0}–{_currentSite.MaxFreq:0.0} Гц",
+                        $"Thresholds: swell {_currentSite.HnSwell} V · sag {_currentSite.HnSag} V · transient {_currentSite.HnImpulse} Vp · " +
+                        $"N-G {_currentSite.NgSurge} V / {_currentSite.NgImpulse} Vp · frequency {_currentSite.MinFreq:0.0}–{_currentSite.MaxFreq:0.0} Hz");
+                    g.DrawString(thr, small, Brushes.DimGray, left, y);
+                    y += 16;
+
+                    if (_lblSummary != null && !string.IsNullOrEmpty(_lblSummary.Text))
+                    {
+                        g.DrawString(_lblSummary.Text, small, Brushes.DimGray, left, y);
+                        y += 16;
+                    }
+                }
+
+                y += 4;
+                g.DrawLine(Pens.Black, left, y, left + width, y);
+                y += 6;
+
+                // Шапка таблицы
+                float colNo = left;
+                float colDate = left + width * 0.06f;
+                float colEvent = left + width * 0.30f;
+                float colMag = left + width * 0.58f;
+                float colEnd = left + width * 0.74f;
+
+                g.DrawString("#", h2, Brushes.Black, colNo, y);
+                g.DrawString(T("Дата и время", "Start Time"), h2, Brushes.Black, colDate, y);
+                g.DrawString(T("Событие", "Event"), h2, Brushes.Black, colEvent, y);
+                g.DrawString(T("Амплитуда", "Extreme"), h2, Brushes.Black, colMag, y);
+                g.DrawString(T("Длительность/фаза", "Duration/Degree"), h2, Brushes.Black, colEnd, y);
+                y += 16;
+                g.DrawLine(Pens.Gray, left, y, left + width, y);
+                y += 4;
+
+                float lineH = body.GetHeight(g) + 4f;
+
+                // Строки событий
+                while (_printRowIndex < _printEvents.Count && y + lineH < bounds.Bottom - 24)
+                {
+                    var ev = _printEvents[_printRowIndex];
+                    g.DrawString(ev.Index.ToString(), body, Brushes.Black, colNo, y);
+                    g.DrawString(ev.Timestamp.ToString("dd.MM.yyyy HH:mm:ss"), body, Brushes.Black, colDate, y);
+                    g.DrawString(ev.GetLocalizedEventName(_lang), body, Brushes.Black, colEvent, y);
+                    g.DrawString(ev.ExtremeText, body, Brushes.Black, colMag, y);
+                    g.DrawString(ev.GetLocalizedEndText(_lang), body, Brushes.Black, colEnd, y);
+
+                    y += lineH;
+                    _printRowIndex++;
+                }
+
+                if (_printEvents.Count == 0)
+                {
+                    g.DrawString(T("Событий нет.", "No events."), body, Brushes.Gray, colDate, y);
+                    y += lineH;
+                }
+
+                // Нижний колонтитул
+                string footer = T($"Страница {_printPageNo} · записей: {_printEvents.Count}",
+                                  $"Page {_printPageNo} · records: {_printEvents.Count}");
+                g.DrawString(footer, small, Brushes.Gray, left, bounds.Bottom - 14);
+
+                if (_printRowIndex < _printEvents.Count)
+                {
+                    _printPageNo++;
+                    e.HasMorePages = true;
+                }
+                else
+                {
+                    e.HasMorePages = false;
+                    _printRowIndex = 0;
+                    _printPageNo = 1;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Открывает окно сервисной калибровки, передавая ему текущее измерение прибора.
+        /// </summary>
+        private void ShowCalibrationDialog()
+        {
+            using (var dlg = new CalibrationForm(
+                () => (_currentSite != null && _currentSite.HasValidData) ? _currentSite.LiveHnVolt : 0,
+                () => _isScanning && _serialPort != null && _serialPort.IsOpen,
+                _lang,
+                LogMessage))
+            {
+                dlg.ShowDialog(this);
+            }
+        }
+
         private void OnOpenVerFile(object sender, EventArgs e)
         {
             using (var ofd = new OpenFileDialog { Filter = "Site Files (*.ver)|*.ver|All Files (*.*)|*.*" })
@@ -3036,11 +4035,13 @@ namespace FlukeEventView
                     {
                         _currentSite = SiteData.LoadFromVerFile(ofd.FileName);
                         _selectedTransientEvent = _currentSite.Events.LastOrDefault(x => x.IsSingleTransient);
-                        this.Text = $"Fluke EventView EV101 - [SN F{_currentSite.SerialNumber} - {Path.GetFileName(ofd.FileName)}]";
+                        this.Text = $"Fluke EventView VR101 - [SN F{_currentSite.SerialNumber} - {Path.GetFileName(ofd.FileName)}]";
                         PopulateSetupInputsFromSite(_currentSite);
                         SyncFilterDatePickersFromSite(_currentSite);
                         UpdateRealtimeAndInfoPanels(_currentSite);
                         PopulateEventsGrid(_currentSite);
+                        _hasUnsavedSessionData = false;
+                        UpdateDirtyMarker();
                         LogMessage($"Loaded file \"{ofd.FileName}\" ({_currentSite.Events.Count} events).");
                     }
                     catch (Exception ex)
@@ -3068,6 +4069,8 @@ namespace FlukeEventView
                 {
                     _currentSite.Description = _txtSiteDesc.Text;
                     _currentSite.SaveToVerFile(sfd.FileName);
+                    _hasUnsavedSessionData = false;
+                    UpdateDirtyMarker();
                     LogMessage($"File Saved: {sfd.FileName}");
                 }
             }
@@ -3122,496 +4125,4 @@ namespace FlukeEventView
     // =========================================================================
     // КЛАСС ДАННЫХ ПРИБОРА И ПАРСЕР ФОРМАТА .VER (VB3 152B Header + 16B Events)
     // =========================================================================
-    public class SiteData
-    {
-        public bool HasValidData { get; set; } = false;
-
-        public string Description { get; set; } = "";
-        public int SerialNumber { get; set; } = 0;
-        public int FirmwareVersion { get; set; } = 0;
-        public byte OptionsByte { get; set; } = 0x00;
-
-        public uint ElapsedTicks { get; set; }
-        public DateTime StartTime { get; set; }
-        public DateTime EndTime { get; set; }
-
-        public bool Is220V { get; set; } = true;
-        public bool Is50Hz { get; set; } = true;
-        public bool IsFifo { get; set; } = true;
-        public bool FlashLed { get; set; } = true;
-        public bool NgScale025 { get; set; } = false;
-        public bool IsMemoryFull { get; set; } = false;
-
-        public int HnSag { get; set; } = 210;
-        public int HnSwell { get; set; } = 256;
-        public int HnImpulse { get; set; } = 200;
-        public double NgSurge { get; set; } = 10.0;
-        public int NgImpulse { get; set; } = 100;
-        public double MinFreq { get; set; } = 48.8;
-        public double MaxFreq { get; set; } = 51.2;
-
-        public double LiveHnVolt { get; set; }
-        public double LiveNgVolt { get; set; }
-        public double LiveFreq { get; set; }
-
-        public int StoredEventCount { get; set; }
-        public byte[] RawHeader88 { get; set; } = new byte[88];
-        public byte[] RawHeader150 { get; set; } = new byte[150];
-
-        public List<EventRecord> OpenEvents { get; set; } = new List<EventRecord>();
-        public List<EventRecord> Events { get; set; } = new List<EventRecord>();
-
-        public static SiteData ParseFromDeviceHeader(byte[] h, DateTime nowTime)
-        {
-            var s = new SiteData { HasValidData = true };
-            Array.Copy(h, 0, s.RawHeader88, 0, Math.Min(88, h.Length));
-
-            s.ElapsedTicks = (uint)((h[0] << 16) | (h[1] << 8) | h[2]);
-
-            uint endTicks = (uint)((h[82] << 16) | (h[83] << 8) | h[84]);
-            if (endTicks == 0 || endTicks > s.ElapsedTicks) endTicks = s.ElapsedTicks;
-
-            s.StartTime = nowTime.AddSeconds(-(s.ElapsedTicks * 8.0));
-            s.EndTime = s.StartTime.AddSeconds(endTicks * 8.0);
-
-            byte b51 = h[51];
-            s.Is220V = (b51 & 0x80) != 0;
-            s.FirmwareVersion = b51 & 0x0F;
-            s.NgScale025 = (b51 & 0x10) != 0;
-            double vMult = s.Is220V ? 2.0 : 1.0;
-
-            s.LiveHnVolt = h[3] * vMult;
-            s.LiveNgVolt = s.NgScale025 ? (h[4] * 0.25) : h[4];
-
-            int liveFreqWord = (h[56] << 8) | h[57];
-            s.LiveFreq = liveFreqWord > 100 ? Math.Round(57600.0 / liveFreqWord, 1) : 50.0;
-
-            s.OptionsByte = h[6];
-            s.Is50Hz = (s.OptionsByte & 0x04) != 0;
-            s.FlashLed = (s.OptionsByte & 0x02) == 0;
-            s.IsFifo = (s.OptionsByte & 0x01) != 0;
-
-            int minFreqWord = (h[7] << 8) | h[8];
-            int maxFreqWord = (h[9] << 8) | h[10];
-            if (minFreqWord > 100) s.MinFreq = Math.Round(57600.0 / minFreqWord, 1);
-            if (maxFreqWord > 100) s.MaxFreq = Math.Round(57600.0 / maxFreqWord, 1);
-
-            s.HnSag = (int)Math.Round(h[11] * vMult);
-            s.HnSwell = (int)Math.Round(h[12] * vMult);
-            s.HnImpulse = h[13] * 10;
-            s.NgSurge = s.NgScale025 ? Math.Round(h[14] * 0.25, 1) : h[14];
-            s.NgImpulse = h[15] * 10;
-
-            s.Description = Encoding.ASCII.GetString(h, 20, 30).Trim('\0', ' ');
-            s.SerialNumber = (h[52] << 8) | h[53];
-
-            int ptrBytes = (h[54] << 8) | h[55];
-            if (h[50] != 0)
-            {
-                s.IsMemoryFull = true;
-                s.StoredEventCount = 4000;
-            }
-            else
-            {
-                s.IsMemoryFull = false;
-                s.StoredEventCount = ptrBytes / 8;
-            }
-
-            if (s.StoredEventCount > 0)
-            {
-                for (int slot = 0; slot < 3; slot++)
-                {
-                    byte[] slotBytes = new byte[8];
-                    Array.Copy(h, 64 + slot * 8, slotBytes, 0, 8);
-                    if (slotBytes[0] != 0x00 && slotBytes[0] != 0xFF)
-                    {
-                        var openEv = EventRecord.Decode(slotBytes, 0, s.StartTime, s.Is220V, s.Is50Hz, s.NgScale025, true);
-                        s.OpenEvents.Add(openEv);
-                    }
-                }
-            }
-
-            if (s.OpenEvents.Count > 0)
-            {
-                s.StartTime = s.OpenEvents[0].Timestamp.AddSeconds(-16);
-            }
-
-            return s;
-        }
-
-        public void ParseAllEvents(byte[] rawBuffer)
-        {
-            Events.Clear();
-            int maxEvents = Math.Min(StoredEventCount, rawBuffer.Length / 8);
-            for (int i = 0; i < maxEvents; i++)
-            {
-                byte[] b = new byte[8];
-                Array.Copy(rawBuffer, i * 8, b, 0, 8);
-                if (b[0] == 0xFF || b[0] == 0x00) continue;
-                Events.Add(EventRecord.Decode(b, i + 1, StartTime, Is220V, Is50Hz, NgScale025, false));
-            }
-        }
-
-        public static SiteData LoadFromVerFile(string path)
-        {
-            byte[] data = File.ReadAllBytes(path);
-            if (data.Length < 152)
-                throw new InvalidDataException("Файл .VER поврежден или имеет неверный размер (< 152 байт).");
-
-            var s = new SiteData { HasValidData = true };
-            Array.Copy(data, 2, s.RawHeader150, 0, 150);
-
-            s.EndTime = DateTime.FromOADate(BitConverter.ToDouble(data, 2));
-            s.StartTime = DateTime.FromOADate(BitConverter.ToDouble(data, 10));
-
-            s.ElapsedTicks = BitConverter.ToUInt32(data, 18);
-            s.SerialNumber = BitConverter.ToInt32(data, 22);
-
-            byte b51 = data[92];
-            if (b51 == 0) b51 = 0x89;
-            s.Is220V = (b51 & 0x80) != 0;
-            s.FirmwareVersion = b51 & 0x0F;
-            s.NgScale025 = (b51 & 0x10) != 0;
-            double vMult = s.Is220V ? 2.0 : 1.0;
-
-            s.LiveHnVolt = BitConverter.ToUInt16(data, 26) * vMult;
-            s.LiveNgVolt = s.NgScale025 ? (data[29] * 0.25) : data[29];
-            double savedFreq = BitConverter.ToDouble(data, 102);
-            s.LiveFreq = (savedFreq > 40.0 && savedFreq < 70.0) ? Math.Round(savedFreq, 1) : 50.0;
-
-            s.OptionsByte = data[32];
-            s.Is50Hz = (s.OptionsByte & 0x04) != 0;
-            s.FlashLed = (s.OptionsByte & 0x02) == 0;
-            s.IsFifo = (s.OptionsByte & 0x01) != 0;
-
-            int wordA = BitConverter.ToInt32(data, 34);
-            int wordB = BitConverter.ToInt32(data, 38);
-            if (wordA > 100 && wordB > 100)
-            {
-                double fA = Math.Round(57600.0 / wordA, 1);
-                double fB = Math.Round(57600.0 / wordB, 1);
-                s.MinFreq = Math.Min(fA, fB);
-                s.MaxFreq = Math.Max(fA, fB);
-            }
-
-            s.HnSag = (int)Math.Round(BitConverter.ToUInt16(data, 42) * vMult);
-            s.HnSwell = (int)Math.Round(BitConverter.ToUInt16(data, 44) * vMult);
-            s.HnImpulse = BitConverter.ToUInt16(data, 46) * 10;
-            ushort rawNgSwell = BitConverter.ToUInt16(data, 48);
-            s.NgSurge = s.NgScale025 ? Math.Round(rawNgSwell * 0.25, 1) : rawNgSwell;
-            s.NgImpulse = BitConverter.ToUInt16(data, 50) * 10;
-
-            s.Description = Encoding.ASCII.GetString(data, 52, 30).Trim('\0', ' ');
-
-            int ptrBytes = BitConverter.ToInt32(data, 110);
-            int totBytes = BitConverter.ToInt32(data, 114);
-            int headerEventCount = Math.Max(ptrBytes, totBytes) / 8;
-            int remainingBytes = data.Length - 152;
-
-            for (int slot = 0; slot < 3; slot++)
-            {
-                byte[] slotBytes = new byte[8];
-                Array.Copy(data, 126 + slot * 8, slotBytes, 0, 8);
-                if (slotBytes[0] != 0x00 && slotBytes[0] != 0xFF)
-                {
-                    var openEv = EventRecord.Decode(slotBytes, 0, s.StartTime, s.Is220V, s.Is50Hz, s.NgScale025, true);
-                    s.OpenEvents.Add(openEv);
-                }
-            }
-
-            if (remainingBytes >= 16 && remainingBytes % 16 == 0)
-            {
-                int evCount = remainingBytes / 16;
-                if (headerEventCount > 0 && headerEventCount < evCount)
-                    evCount = headerEventCount;
-
-                s.StoredEventCount = evCount;
-                byte[] packedEvents = new byte[evCount * 8];
-                for (int e = 0; e < evCount; e++)
-                {
-                    for (int bIdx = 0; bIdx < 8; bIdx++)
-                    {
-                        packedEvents[e * 8 + bIdx] = data[152 + e * 16 + bIdx * 2];
-                    }
-                }
-                s.ParseAllEvents(packedEvents);
-            }
-            else if (remainingBytes >= 8)
-            {
-                s.StoredEventCount = remainingBytes / 8;
-                byte[] evBuf = new byte[remainingBytes];
-                Array.Copy(data, 152, evBuf, 0, remainingBytes);
-                s.ParseAllEvents(evBuf);
-            }
-
-            return s;
-        }
-
-        public void SaveToVerFile(string path)
-        {
-            using (var fs = new FileStream(path, FileMode.Create))
-            using (var bw = new BinaryWriter(fs))
-            {
-                bw.Write(Encoding.ASCII.GetBytes(".2"));
-                byte[] hdr = (byte[])RawHeader150.Clone();
-
-                double vDiv = Is220V ? 2.0 : 1.0;
-                BitConverter.GetBytes(EndTime.ToOADate()).CopyTo(hdr, 0);
-                BitConverter.GetBytes(StartTime.ToOADate()).CopyTo(hdr, 8);
-                BitConverter.GetBytes((int)ElapsedTicks).CopyTo(hdr, 16);
-                BitConverter.GetBytes(SerialNumber).CopyTo(hdr, 20);
-                BitConverter.GetBytes((short)Math.Round(LiveHnVolt / vDiv)).CopyTo(hdr, 24);
-                BitConverter.GetBytes((short)OptionsByte).CopyTo(hdr, 30);
-
-                int maxFWord = (int)Math.Round(57600.0 / MaxFreq);
-                int minFWord = (int)Math.Round(57600.0 / MinFreq);
-                BitConverter.GetBytes(maxFWord).CopyTo(hdr, 32);
-                BitConverter.GetBytes(minFWord).CopyTo(hdr, 36);
-
-                BitConverter.GetBytes((short)Math.Round(HnSag / vDiv)).CopyTo(hdr, 40);
-                BitConverter.GetBytes((short)Math.Round(HnSwell / vDiv)).CopyTo(hdr, 42);
-                BitConverter.GetBytes((short)(HnImpulse / 10)).CopyTo(hdr, 44);
-                BitConverter.GetBytes((short)(NgScale025 ? Math.Round(NgSurge * 4.0) : Math.Round(NgSurge))).CopyTo(hdr, 46);
-                BitConverter.GetBytes((short)(NgImpulse / 10)).CopyTo(hdr, 48);
-
-                string d30 = (Description ?? "").PadRight(30, ' ').Substring(0, 30);
-                Encoding.ASCII.GetBytes(d30).CopyTo(hdr, 50);
-
-                BitConverter.GetBytes((short)3).CopyTo(hdr, 80);
-                BitConverter.GetBytes(32000).CopyTo(hdr, 82);
-                byte b51 = (byte)((Is220V ? 0x80 : 0x00) | (NgScale025 ? 0x10 : 0x00) | (FirmwareVersion & 0x0F));
-                BitConverter.GetBytes((short)b51).CopyTo(hdr, 90);
-                BitConverter.GetBytes(LiveFreq).CopyTo(hdr, 100);
-
-                BitConverter.GetBytes(Events.Count * 8).CopyTo(hdr, 108);
-                BitConverter.GetBytes(Events.Count * 8).CopyTo(hdr, 112);
-
-                for (int slot = 0; slot < Math.Min(3, OpenEvents.Count); slot++)
-                {
-                    Array.Copy(OpenEvents[slot].Raw, 0, hdr, 124 + slot * 8, 8);
-                }
-
-                BitConverter.GetBytes((ushort)(Events.Count > 0 ? 1 : 0)).CopyTo(hdr, 148);
-                bw.Write(hdr);
-
-                foreach (var ev in Events)
-                {
-                    for (int i = 0; i < 8; i++)
-                    {
-                        bw.Write((ushort)ev.Raw[i]);
-                    }
-                }
-            }
-        }
-    }
-
-    // =========================================================================
-    // КЛАСС ДЕКОДИРОВАНИЯ 8-БАЙТНОЙ ЗАПИСИ СОБЫТИЯ (EventRecord)
-    // =========================================================================
-    public class EventRecord
-    {
-        public int Index { get; set; }
-        public byte[] Raw { get; set; } = new byte[8];
-        public DateTime Timestamp { get; set; }
-        public EventCategory Category { get; set; } = EventCategory.All;
-        public string EventNameEn { get; set; } = "";
-        public string EventNameRu { get; set; } = "";
-        public string ExtremeText { get; set; } = "";
-        public string EndTextEn { get; set; } = "";
-        public string EndTextRu { get; set; } = "";
-
-        public bool IsOpenEvent { get; set; }
-        public bool IsTransient { get; set; }
-        public bool IsNgTransient { get; set; }
-        public int TransientCount { get; set; }
-        public bool IsSingleTransient => IsTransient && !IsOpenEvent && TransientCount == 1;
-        public int TransientPeakSigned { get; set; }
-        public int PhaseDegrees { get; set; }
-
-        public string GetLocalizedEventName(AppLang lang) => lang == AppLang.Ru ? EventNameRu : EventNameEn;
-        public string GetLocalizedEndText(AppLang lang) => lang == AppLang.Ru ? EndTextRu : EndTextEn;
-
-        public static EventRecord Decode(byte[] b, int index, DateTime baseStart, bool is220, bool is50, bool ngScale025, bool isOpenEvent)
-        {
-            var r = new EventRecord { Index = index, Raw = b, IsOpenEvent = isOpenEvent };
-            byte type = b[0];
-
-            uint eventTicks = (uint)((b[5] << 16) | (b[6] << 8) | b[7]);
-            r.Timestamp = baseStart.AddSeconds(eventTicks * 8.0);
-
-            double vMult = is220 ? 2.0 : 1.0;
-            double baseFreq = is50 ? 50.0 : 60.0;
-            double ticksPerDeg = is50 ? 3.2 : (960.0 / 360.0);
-
-            uint rawDur = (uint)((b[2] << 16) | (b[3] << 8) | b[4]);
-            bool durIn8SecTicks = (type == 0x06 || type == 0x86 || type == 0x08 || type == 0x88);
-
-            string durEn = isOpenEvent ? "Open Event" : (durIn8SecTicks ? FormatTickDuration(rawDur, AppLang.En) : FormatHalfCycles(rawDur, baseFreq, AppLang.En));
-            string durRu = isOpenEvent ? "Активное событие" : (durIn8SecTicks ? FormatTickDuration(rawDur, AppLang.Ru) : FormatHalfCycles(rawDur, baseFreq, AppLang.Ru));
-
-            switch (type)
-            {
-                case 0x01:
-                case 0x02:
-                    string sign = (type == 0x01) ? "-" : "+";
-                    int count = b[2] > 0 ? b[2] : 1;
-                    int phaseTicks = (b[3] << 8) | b[4];
-                    int deg = (int)Math.Floor((phaseTicks / ticksPerDeg) + 0.625);
-
-                    r.Category = EventCategory.HnTransient;
-                    r.IsTransient = true;
-                    r.IsNgTransient = false;
-                    r.TransientCount = count;
-                    r.TransientPeakSigned = (type == 0x01 ? -1 : 1) * (b[1] * 10);
-                    r.PhaseDegrees = deg;
-
-                    r.EventNameEn = count == 1 ? "1 H-N Transient" : $"{count} H-N Transients";
-                    r.EventNameRu = count == 1 ? "1 Импульс H-N" : $"{count} Импульсов H-N";
-                    r.ExtremeText = $"{sign}{b[1] * 10} Vp";
-                    r.EndTextEn = $"{deg}°";
-                    r.EndTextRu = $"{deg}°";
-                    break;
-
-                case 0x03:
-                case 0x04:
-                    string ngSign = (type == 0x03) ? "-" : "+";
-                    int ngCount = b[2] > 0 ? b[2] : 1;
-                    int ngTicks = (b[3] << 8) | b[4];
-                    int ngDeg = (int)Math.Floor((ngTicks / ticksPerDeg) + 0.625);
-
-                    r.Category = EventCategory.NgTransient;
-                    r.IsTransient = true;
-                    r.IsNgTransient = true;
-                    r.TransientCount = ngCount;
-                    r.TransientPeakSigned = (type == 0x03 ? -1 : 1) * (b[1] * 10);
-                    r.PhaseDegrees = ngDeg;
-
-                    r.EventNameEn = ngCount == 1 ? "1 N-G Transient" : $"{ngCount} N-G Transients";
-                    r.EventNameRu = ngCount == 1 ? "1 Импульс N-G" : $"{ngCount} Импульсов N-G";
-                    r.ExtremeText = $"{ngSign}{b[1] * 10} Vp";
-                    r.EndTextEn = $"{ngDeg}°";
-                    r.EndTextRu = $"{ngDeg}°";
-                    break;
-
-                case 0x85:
-                case 0x86:
-                case 0x16:
-                    r.Category = EventCategory.HnSwell;
-                    r.EventNameEn = "H-N Swell";
-                    r.EventNameRu = "Перенапряжение H-N";
-                    r.ExtremeText = $"{(b[1] * vMult):0}   Vrms";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                case 0x05:
-                case 0x06:
-                case 0x17:
-                    if (b[1] == 0)
-                    {
-                        r.Category = EventCategory.Outage;
-                        r.EventNameEn = "Outage";
-                        r.EventNameRu = "Обрыв питания";
-                        r.ExtremeText = "0 Vrms";
-                    }
-                    else
-                    {
-                        r.Category = EventCategory.HnSag;
-                        r.EventNameEn = "H-N Sag";
-                        r.EventNameRu = "Провал H-N";
-                        r.ExtremeText = $"{(b[1] * vMult):0}   Vrms";
-                    }
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                case 0x07:
-                case 0x08:
-                    r.Category = EventCategory.LowFreq;
-                    r.EventNameEn = "Low Frequency";
-                    r.EventNameRu = "Низкая частота";
-                    double lowF = baseFreq - ((b[1] - 1) * 0.1);
-                    r.ExtremeText = $"{lowF:00.0} Hz";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                case 0x87:
-                case 0x88:
-                    r.Category = EventCategory.HighFreq;
-                    r.EventNameEn = "High Frequency";
-                    r.EventNameRu = "Высокая частота";
-                    double highF = baseFreq + (b[1] * 0.1);
-                    r.ExtremeText = $"{highF:00.0} Hz";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                case 0x12:
-                case 0x14:
-                case 0x09:
-                case 0x89:
-                    r.Category = EventCategory.NgSwell;
-                    r.EventNameEn = "N-G Swell";
-                    r.EventNameRu = "Превышение N-G";
-                    double ngV = ngScale025 ? (b[1] * 0.25) : b[1];
-                    r.ExtremeText = $"{ngV:0.0} Vrms";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                case 0x80:
-                    r.Category = EventCategory.Outage;
-                    r.EventNameEn = "Outage";
-                    r.EventNameRu = "Обрыв питания";
-                    r.ExtremeText = "0 Vrms";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-
-                default:
-                    r.Category = EventCategory.All;
-                    r.EventNameEn = $"Event 0x{type:X2}";
-                    r.EventNameRu = $"Событие 0x{type:X2}";
-                    r.ExtremeText = $"{(b[1] * vMult):0} V";
-                    r.EndTextEn = durEn;
-                    r.EndTextRu = durRu;
-                    break;
-            }
-
-            return r;
-        }
-
-        private static string FormatHalfCycles(uint rawHalfCycles, double lineFreq, AppLang lang)
-        {
-            double cycles = (rawHalfCycles + 1) / 2.0;
-            if (cycles < 50.0)
-                return lang == AppLang.Ru ? $"{cycles:0.0} период." : $"{cycles:0.0} cycles";
-
-            double seconds = cycles / lineFreq;
-            if (seconds < 60.0)
-                return lang == AppLang.Ru ? $"{seconds:0.0} сек" : $"{seconds:0.0} seconds";
-
-            int mins = (int)(seconds / 60);
-            double remSec = seconds - (mins * 60);
-            if (mins < 60)
-                return lang == AppLang.Ru ? $"{mins} мин, {remSec:0.0} сек" : $"{mins} min, {remSec:0.0} sec";
-
-            return TimeSpan.FromSeconds(seconds).ToString(@"hh\:mm\:ss");
-        }
-
-        private static string FormatTickDuration(uint ticks, AppLang lang)
-        {
-            double seconds = ticks * 8.0;
-            if (seconds < 60.0)
-                return lang == AppLang.Ru ? $"{seconds:0.0} сек" : $"{seconds:0.0} seconds";
-
-            int mins = (int)(seconds / 60);
-            int remSec = (int)(seconds - (mins * 60));
-            if (mins < 60)
-                return lang == AppLang.Ru ? $"{mins} мин, {remSec} сек" : $"{mins} minutes, {remSec} seconds";
-
-            return TimeSpan.FromSeconds(seconds).ToString(@"hh\:mm\:ss");
-        }
-    }
 }

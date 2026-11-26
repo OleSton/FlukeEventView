@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+﻿// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 OleSton
 using System;
 using System.Collections.Generic;
@@ -81,6 +81,8 @@ namespace FlukeEventView
         private TabPage _tabLog;
 
         private SplitContainer _splitStatus;
+        private Panel _pnlLeft;
+        private Panel _pnlRight;
         private TableLayoutPanel _tblHn, _tblNg, _tblFreq, _tblReal;
 
         // Группы на вкладке Status
@@ -196,6 +198,7 @@ namespace FlukeEventView
         {
             base.OnLoad(e);
             AdjustStatusSplitterForScale();
+            AlignStatusColumnBottoms();
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
@@ -713,7 +716,8 @@ namespace FlukeEventView
                 Padding = new Padding(6)
             };
 
-            var pnlLeft = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+            _pnlLeft = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+            var pnlLeft = _pnlLeft;
 
             // 1. Пороги Фаза — Нейтраль (H-N)
             _grpHn = new GroupBox { Dock = DockStyle.Top, Height = 132, Padding = new Padding(10) };
@@ -791,7 +795,8 @@ namespace FlukeEventView
             _splitStatus.Panel1.Controls.Add(pnlLeft);
 
             // --- ПРАВАЯ ПАНЕЛЬ: REALTIME (БЕЗ РАМОК, ЕДИНЫЙ ЦВЕТ СТОЛБЦОВ), RECORDER INFO И КНОПКИ ---
-            var pnlRight = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+            _pnlRight = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(6) };
+            var pnlRight = _pnlRight;
 
             _grpRealTime = new GroupBox
             {
@@ -935,6 +940,10 @@ namespace FlukeEventView
             _splitStatus.Panel2.Controls.Add(pnlRight);
 
             page.Controls.Add(_splitStatus);
+
+            // Пересчитываем выравнивание нижних блоков при любом изменении размеров вкладки
+            _splitStatus.SizeChanged += (s, e) => AlignStatusColumnBottoms();
+            _splitStatus.SplitterMoved += (s, e) => AlignStatusColumnBottoms();
         }
 
         private static Label CreateCellLabel(string text, Font font, Color foreColor, ContentAlignment align)
@@ -1452,6 +1461,7 @@ namespace FlukeEventView
 
                 AdjustStatusSplitterForScale();
                 ResizePresetComboToContent();
+                AlignStatusColumnBottoms();
 
                 int pct = (int)Math.Round(_fontScale * 100);
                 _tsbFontReset.Text = $"{pct}%";
@@ -1473,6 +1483,44 @@ namespace FlukeEventView
             int targetLeftWidth = (int)Math.Round(710 * Math.Max(1.0f, _fontScale * 0.95f));
             targetLeftWidth = Math.Min(_splitStatus.Width - 460, Math.Max(660, targetLeftWidth));
             _splitStatus.SplitterDistance = targetLeftWidth;
+        }
+
+        /// <summary>
+        /// Выравнивает нижние края колонок вкладки «Статус»: последний блок левой колонки
+        /// («Описание точки контроля») и последний блок правой («Команды управления регистратором»)
+        /// растягиваются так, чтобы обе колонки заканчивались на одной высоте.
+        /// </summary>
+        private void AlignStatusColumnBottoms()
+        {
+            if (_splitStatus == null || _pnlLeft == null || _pnlRight == null) return;
+            if (_grpHn == null || _grpDesc == null) return;
+
+            const int minLastLeft = 120;
+            const int minLastRight = 120;
+
+            // Левая колонка: H-N, N-G, частоты, опции — фиксированные, «Описание» тянется вниз
+            int leftAvail = _pnlLeft.ClientSize.Height - _pnlLeft.Padding.Vertical;
+            int leftFixed = _grpHn.Height
+                          + (_grpNg != null ? _grpNg.Height : 0)
+                          + (_grpFreq != null ? _grpFreq.Height : 0)
+                          + (_grpOpt != null ? _grpOpt.Height : 0);
+
+            // Правая колонка: RealTime и Recorder Info фиксированные, «Команды» тянется вниз
+            int rightAvail = _pnlRight.ClientSize.Height - _pnlRight.Padding.Vertical;
+            int rightFixed = (_grpRealTime != null ? _grpRealTime.Height : 0)
+                           + (_grpRecInfo != null ? _grpRecInfo.Height : 0);
+
+            // Чтобы нижние края совпали, нижний блок каждой колонки занимает остаток её высоты
+            int leftLast = leftAvail - leftFixed;
+            int rightLast = rightAvail - rightFixed;
+
+            if (leftLast <= 0 || rightLast <= 0) return; // окно слишком маленькое — не трогаем
+
+            if (leftLast < minLastLeft) leftLast = minLastLeft;
+            if (rightLast < minLastRight) rightLast = minLastRight;
+
+            if (_grpDesc.Height != leftLast) _grpDesc.Height = leftLast;
+            if (_grpButtons != null && _grpButtons.Height != rightLast) _grpButtons.Height = rightLast;
         }
 
         // =========================================================================
@@ -3026,12 +3074,11 @@ namespace FlukeEventView
                 _chkShowHnEvents, _chkShowNgEvents, _lblPeriods, _numPeriods
             });
             _tabCharts.Controls.Add(_pnlGraphSetup);
-            _pnlGraphSetup.BringToFront();
-            // Полоса выбора типа графика должна оставаться верхней
-            foreach (Control c in _tabCharts.Controls)
-            {
-                if (c is FlowLayoutPanel) { c.BringToFront(); break; }
-            }
+            // Порядок докинга: сверху полоса выбора типа графика, под ней — панель Graph Setup.
+            // В WinForms раньше докидывается контрол с большим индексом, поэтому полосу отправляем в конец списка.
+            var chartTopBar = _tabCharts.Controls.OfType<FlowLayoutPanel>().FirstOrDefault();
+            if (chartTopBar != null && _tabCharts.Controls.Count > 1)
+                _tabCharts.Controls.SetChildIndex(chartTopBar, _tabCharts.Controls.Count - 1);
 
             BuildPresetPanel();
 
@@ -3232,7 +3279,9 @@ namespace FlukeEventView
 
             _pnlPreset.Controls.AddRange(new Control[] { _lblPreset, _cmbPreset, _btnApplyPreset, _lblPresetNote });
             _tabStatus.Controls.Add(_pnlPreset);
-            _pnlPreset.BringToFront();
+            // Панель добавлена последней, поэтому докинг применяется к ней первой:
+            // она занимает верхнюю полосу, а SplitContainer ниже получает оставшуюся высоту.
+            // BringToFront здесь вызывать нельзя — панель начала бы накрывать блоки уставок.
 
             // После раскладки панели пересчитываем ширину списка под фактическую ширину
             _pnlPreset.Resize += (s, e) => ResizePresetComboToContent();

@@ -1,3 +1,5 @@
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 OleSton
 using System;
 using System.Collections.Generic;
 using System.Data;

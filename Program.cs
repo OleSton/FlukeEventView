@@ -1,4 +1,6 @@
-﻿using System;
+﻿// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 OleSton
+using System;
 using System.Windows.Forms;
 
 namespace FlukeEventView

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 OleSton
 using System;
 using System.Collections.Generic;
@@ -1451,6 +1451,7 @@ namespace FlukeEventView
                 if (_grpButtons != null) _grpButtons.Height = (int)Math.Round(175 * Math.Max(1.0f, _fontScale * 0.95f));
 
                 AdjustStatusSplitterForScale();
+                ResizePresetComboToContent();
 
                 int pct = (int)Math.Round(_fontScale * 100);
                 _tsbFontReset.Text = $"{pct}%";
@@ -3115,6 +3116,8 @@ namespace FlukeEventView
                 int pIdx = _cmbPreset.SelectedIndex;
                 if (pIdx >= 0 && pIdx < _presets.Length && _toolTip != null)
                     _toolTip.SetToolTip(_cmbPreset, T(_presets[pIdx].NoteRu, _presets[pIdx].NoteEn));
+
+                ResizePresetComboToContent();
             }
 
             UpdateEventSummary(_currentSite);
@@ -3195,7 +3198,7 @@ namespace FlukeEventView
 
             _cmbPreset = new ComboBox
             {
-                Width = 260,
+                Width = 430,
                 Left = 150,
                 Top = 6,
                 DropDownStyle = ComboBoxStyle.DropDownList
@@ -3230,6 +3233,47 @@ namespace FlukeEventView
             _pnlPreset.Controls.AddRange(new Control[] { _lblPreset, _cmbPreset, _btnApplyPreset, _lblPresetNote });
             _tabStatus.Controls.Add(_pnlPreset);
             _pnlPreset.BringToFront();
+
+            // После раскладки панели пересчитываем ширину списка под фактическую ширину
+            _pnlPreset.Resize += (s, e) => ResizePresetComboToContent();
+        }
+
+        /// <summary>
+        /// Подгоняет ширину выпадающего списка профилей под самый длинный пункт,
+        /// чтобы названия профилей не обрезались (в том числе при смене языка и масштаба шрифта).
+        /// </summary>
+        private void ResizePresetComboToContent()
+        {
+            if (_cmbPreset == null || _cmbPreset.Items.Count == 0) return;
+
+            int maxTextWidth = 0;
+            using (Graphics gg = _cmbPreset.CreateGraphics())
+            {
+                foreach (object item in _cmbPreset.Items)
+                {
+                    string text = item as string;
+                    if (string.IsNullOrEmpty(text)) continue;
+
+                    Size sz = TextRenderer.MeasureText(gg, text, _cmbPreset.Font);
+                    if (sz.Width > maxTextWidth) maxTextWidth = sz.Width;
+                }
+            }
+
+            // запас под стрелку списка и внутренние отступы
+            int width = Math.Max(320, maxTextWidth + SystemInformation.VerticalScrollBarWidth + 28);
+
+            // не даём списку выйти за пределы панели, но только если панель уже разложена
+            int panelWidth = _pnlPreset != null ? _pnlPreset.Width : 0;
+            if (panelWidth >= 600)
+            {
+                int roomForCombo = Math.Max(320, panelWidth - _cmbPreset.Left - 200);
+                if (width > roomForCombo) width = roomForCombo;
+            }
+
+            _cmbPreset.Width = width;
+
+            if (_btnApplyPreset != null) _btnApplyPreset.Left = _cmbPreset.Right + 8;
+            if (_lblPresetNote != null && _btnApplyPreset != null) _lblPresetNote.Left = _btnApplyPreset.Right + 12;
         }
 
         /// <summary>

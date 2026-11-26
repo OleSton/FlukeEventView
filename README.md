@@ -13,6 +13,22 @@
 
 ---
 
+## Скачать
+
+Готовые сборки — в разделе [Releases](https://github.com/OleSton/FlukeEventView/releases):
+
+* **Последняя версия: [v2.16.1](https://github.com/OleSton/FlukeEventView/releases/latest)** —
+  архив `FlukeEventView-v2.16.1-win.zip` (исполняемый файл, иконка, этот README).
+* v2.16.1 исправляет оформление вкладки «Статус»: ширина выпадающего списка профилей,
+  отсутствие наложения панели профилей на блоки уставок, выравнивание нижних краёв колонок,
+  порядок блоков на вкладке «Графики».
+* Первая публичная версия — v2.16.0.
+
+Сборка из исходников: откройте `FlukeEventView.sln` в Visual Studio 2019 или выполните
+`msbuild FlukeEventView.csproj /t:Rebuild /p:Configuration=Release`. Требуется .NET Framework 4.7.2.
+
+---
+
 ## Возможности
 
 ### Работа с прибором

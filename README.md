@@ -13,6 +13,10 @@
 
 ---
 
+![Вкладка «Статус и Уставки»: профили порогов, показания в реальном времени, команды управления регистратором](docs/screenshot-status.png)
+
+---
+
 ## Скачать
 
 Готовые сборки — в разделе [Releases](https://github.com/OleSton/FlukeEventView/releases):
